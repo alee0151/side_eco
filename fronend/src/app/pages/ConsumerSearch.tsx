@@ -1,6 +1,6 @@
 import { useState, useRef } from 'react';
 import { useNavigate } from 'react-router';
-import { Barcode, Search, Building2, ArrowRight, ShieldCheck, Sparkles, Leaf, CheckCircle2, CircleDot, MapPin, TrendingUp, Flame, FileText } from 'lucide-react';
+import { Barcode, Search, Building2, ArrowRight, ShieldCheck, Sparkles, Leaf, CheckCircle2, CircleDot, MapPin, TrendingUp, Flame, FileText, Loader2 } from 'lucide-react';
 import { Card, Chip, RiskBadge, Confidence } from '../components/shared';
 import { ImageWithFallback } from '../components/figma/ImageWithFallback';
 
@@ -13,11 +13,27 @@ const suggestions = [
   { label: 'Bega Cheese', abn: '81 008 358 503', sector: 'Food & Beverage', score: 54 },
 ];
 
-const betterChoices = [
-  { brand: 'Five:am Organics', score: 82, level: 'Low' as const, note: 'Certified regenerative dairy, low land-use footprint.' },
-  { brand: 'Barambah Organics', score: 78, level: 'Low' as const, note: 'Supplier traceability to farm-gate; minimal protected area overlap.' },
-  { brand: 'Pure Harvest', score: 71, level: 'Medium' as const, note: 'Plant-based alternative with 38% lower biodiversity pressure.' },
-];
+// FIX Bug 7: betterChoices is now driven from API data; this type describes a single alternative
+type BetterChoice = {
+  brand: string;
+  score: number;
+  level: 'Low' | 'Medium' | 'High' | 'Critical';
+  note: string;
+};
+
+// FIX Bug 7: risk factors are now driven from API data
+type RiskFactor = {
+  color: 'amber' | 'emerald' | 'orange' | 'rose';
+  text: string;
+};
+
+// FIX Bug 4: derive the correct RiskBadge level from a numeric score
+function getRiskLevel(score: number): 'Low' | 'Medium' | 'High' | 'Critical' {
+  if (score < 35) return 'Low';
+  if (score < 55) return 'Medium';
+  if (score < 75) return 'High';
+  return 'Critical';
+}
 
 const TopoSvg = ({ className = '' }: { className?: string }) => (
   <svg className={className} viewBox="0 0 800 400" preserveAspectRatio="none" fill="none">
@@ -31,14 +47,25 @@ export function ConsumerSearch() {
   const navigate = useNavigate();
   const [mode, setMode] = useState<'barcode' | 'brand' | 'company'>('barcode');
   const [value, setValue] = useState('');
+  // FIX Bug 3: loading state to prevent double-submissions and give UX feedback
+  const [isLoading, setIsLoading] = useState(false);
+  // FIX Bug 2: state to track the uploaded PDF file
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  // Inline error state to replace alert() calls (partial improvement; full alert removal is Bug 8)
+  const [error, setError] = useState<string | null>(null);
+
   const [resolved, setResolved] = useState<null | {
     brand: string;
     product: string;
     parent: string;
     abn: string;
-    score: number;
+    biodiversityScore: number;   // FIX Bug 1: renamed from score to be explicit
+    confidence: number;           // FIX Bug 1: kept separately for the Confidence component
     source?: string;
     imageUrl?: string;
+    // FIX Bug 7: API-driven risk factors and alternatives
+    riskFactors: RiskFactor[];
+    betterChoices: BetterChoice[];
   }>(null);
 
   const resultsRef = useRef<HTMLDivElement>(null);
@@ -48,26 +75,29 @@ export function ConsumerSearch() {
     searchValue: string
   ) => {
     if (searchMode === 'barcode') {
-      return {
-        barcode: searchValue,
-        brand: '',
-        company_or_abn: '',
-      };
+      return { barcode: searchValue, brand: '', company_or_abn: '' };
     }
-
     if (searchMode === 'brand') {
-      return {
-        barcode: '',
-        brand: searchValue,
-        company_or_abn: '',
-      };
+      return { barcode: '', brand: searchValue, company_or_abn: '' };
     }
+    return { barcode: '', brand: '', company_or_abn: searchValue };
+  };
 
-    return {
-      barcode: '',
-      brand: '',
-      company_or_abn: searchValue,
-    };
+  // FIX Bug 2: handle PDF upload — post to backend as FormData
+  const handleFileUpload = async (file: File) => {
+    if (!file) return;
+    setUploadedFile(file);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      await fetch('http://127.0.0.1:8000/api/upload', {
+        method: 'POST',
+        body: form,
+      });
+    } catch (err) {
+      console.error('File upload error:', err);
+      setError('Failed to upload the PDF. Please try again.');
+    }
   };
 
   const resolveWithValue = async (
@@ -75,20 +105,21 @@ export function ConsumerSearch() {
     rawValue: string
   ) => {
     const searchValue = rawValue.trim();
+    setError(null);
 
     if (!searchValue) {
-      alert('Please enter a barcode, brand, company name, or ABN.');
+      setError('Please enter a barcode, brand, company name, or ABN.');
       return;
     }
 
+    // FIX Bug 3: set loading before fetch, clear in finally
+    setIsLoading(true);
     try {
       const requestBody = buildRequestBody(searchMode, searchValue);
 
       const res = await fetch('http://127.0.0.1:8000/api/search', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
       });
 
@@ -100,7 +131,7 @@ export function ConsumerSearch() {
 
       if (!data.query_id) {
         console.error('No query_id returned', data);
-        alert('Search completed, but no query_id was returned.');
+        setError('Search completed, but no query_id was returned.');
         return;
       }
 
@@ -111,11 +142,42 @@ export function ConsumerSearch() {
 
       if (!result) {
         console.error('No result returned', data);
-        alert('No matching result found.');
+        setError('No matching result found.');
         return;
       }
 
-      setResolved({
+      // FIX Bug 1: map the correct biodiversity score field from the API response.
+      // result.risk_score or result.biodiversity_score holds the actual 0–100 biodiversity
+      // impact score. result.confidence is the entity-resolution confidence and is
+      // kept separately so it feeds the <Confidence> component correctly.
+      const biodiversityScore =
+        result.risk_score ??
+        result.biodiversity_score ??
+        result.score ??
+        50;
+
+      const confidence =
+        result.confidence ??
+        result.resolution_confidence ??
+        50;
+
+      // FIX Bug 7: pull risk factors and alternatives from the API response if
+      // available; fall back to empty arrays so the UI degrades gracefully.
+      const riskFactors: RiskFactor[] = (result.risk_factors ?? []).map((f: { color?: string; text?: string; description?: string }) => ({
+        color: (f.color as RiskFactor['color']) ?? 'amber',
+        text: f.text ?? f.description ?? '',
+      }));
+
+      const betterChoices: BetterChoice[] = (result.alternatives ?? result.better_choices ?? []).map(
+        (b: { brand?: string; brand_name?: string; score?: number; biodiversity_score?: number; risk_level?: string; level?: string; note?: string; description?: string }) => ({
+          brand: b.brand ?? b.brand_name ?? 'Unknown',
+          score: b.score ?? b.biodiversity_score ?? 0,
+          level: (b.risk_level ?? b.level ?? 'Medium') as BetterChoice['level'],
+          note: b.note ?? b.description ?? '',
+        })
+      );
+
+      const resolvedData = {
         brand:
           result.brand?.brand_name ||
           result.product?.brand ||
@@ -141,20 +203,31 @@ export function ConsumerSearch() {
           result.abn_verification?.abn ||
           'N/A',
 
-        score: result.confidence || 50,
+        biodiversityScore,
+        confidence,
         source: result.source,
         imageUrl: result.product?.image_url,
-      });
+        riskFactors,
+        betterChoices,
+      };
 
+      setResolved(resolvedData);
+
+      // FIX Bug 5: pass query_id and resolved data as route state so CompanyOverview
+      // can access the context without relying solely on localStorage.
+      // We store it here so navigate() can carry it after state is set.
       setTimeout(() => {
-        resultsRef.current?.scrollIntoView({
-          behavior: 'smooth',
-          block: 'start',
-        });
+        resultsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 100);
+
+      // Store for use in the "View full report" button below
+      localStorage.setItem('resolved_data', JSON.stringify(resolvedData));
     } catch (err) {
       console.error(err);
-      alert('Error connecting to backend');
+      setError('Error connecting to backend. Please check the server is running.');
+    } finally {
+      // FIX Bug 3: always clear loading state
+      setIsLoading(false);
     }
   };
 
@@ -183,7 +256,7 @@ export function ConsumerSearch() {
         <div className="relative z-10 max-w-4xl mx-auto px-8 pt-16 pb-20">
           <div className="flex items-center gap-3 mb-5 text-emerald-200/80 font-mono text-[11px] tracking-[0.2em]">
             <span className="w-8 h-px bg-emerald-300/60" />
-            <span>§ 01 · RESOLVE & SCORE</span>
+            <span>§ 01 · RESOLVE &amp; SCORE</span>
           </div>
 
           <h1 className="text-[40px] md:text-[52px] leading-[1.05] tracking-tight text-white max-w-2xl">
@@ -208,7 +281,8 @@ export function ConsumerSearch() {
                 return (
                   <button
                     key={t.id}
-                    onClick={() => setMode(t.id)}
+                    // FIX Bug 9 (medium): clear value on mode switch to prevent stale input
+                    onClick={() => { setMode(t.id); setValue(''); setError(null); }}
                     className={`flex-1 inline-flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-[13px] tracking-tight transition ${
                       active ? 'bg-white text-stone-900 shadow-sm' : 'text-stone-500 hover:text-stone-900'
                     }`}
@@ -224,24 +298,54 @@ export function ConsumerSearch() {
               <input
                 value={value}
                 onChange={e => setValue(e.target.value)}
+                // FIX Bug 6: trigger search on Enter key press
+                onKeyDown={e => e.key === 'Enter' && !isLoading && resolve()}
                 placeholder={mode === 'barcode' ? '9 310072 011691' : mode === 'brand' ? 'e.g. Dairy Farmers, Tim Tam…' : 'Company name or ABN'}
                 className="flex-1 h-11 bg-transparent outline-none text-[14px] text-stone-800 placeholder:text-stone-400"
               />
+              {/* FIX Bug 3: show spinner and disable button while loading */}
               <button
                 onClick={resolve}
-                className="inline-flex items-center gap-1.5 px-5 h-10 bg-emerald-500 hover:bg-emerald-400 text-stone-950 rounded-lg text-[13px] shadow-[0_8px_24px_-8px_rgba(16,185,129,0.6)]"
+                disabled={isLoading}
+                className="inline-flex items-center gap-1.5 px-5 h-10 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 disabled:cursor-not-allowed text-stone-950 rounded-lg text-[13px] shadow-[0_8px_24px_-8px_rgba(16,185,129,0.6)] transition"
               >
-                Analyse <ArrowRight size={14} />
+                {isLoading ? (
+                  <><Loader2 size={14} className="animate-spin" /> Analysing…</>
+                ) : (
+                  <>Analyse <ArrowRight size={14} /></>
+                )}
               </button>
             </div>
 
+            {/* FIX Bug 8 (partial): inline error message instead of alert() */}
+            {error && (
+              <div className="mx-2 mb-1 px-3 py-2 rounded-lg bg-rose-50 border border-rose-200 text-[12px] text-rose-700">
+                {error}
+              </div>
+            )}
+
+            {/* FIX Bug 2: wire up onChange to actually capture and upload the PDF */}
             <div className="mx-2 mb-2 p-3 rounded-xl bg-stone-50 border border-dashed border-stone-200 group hover:bg-stone-100 hover:border-stone-300 transition-colors cursor-pointer text-center relative">
-              <input type="file" accept=".pdf" className="absolute inset-0 opacity-0 cursor-pointer w-full h-full" />
+              <input
+                type="file"
+                accept=".pdf"
+                className="absolute inset-0 opacity-0 cursor-pointer w-full h-full"
+                onChange={e => {
+                  const file = e.target.files?.[0];
+                  if (file) handleFileUpload(file);
+                }}
+              />
               <div className="flex flex-col items-center justify-center gap-1.5 pointer-events-none">
                 <div className="w-8 h-8 rounded-full bg-white shadow-sm flex items-center justify-center text-emerald-600 group-hover:scale-110 transition-transform">
                   <FileText size={14} />
                 </div>
-                <div className="text-[12px] font-medium text-stone-700">Upload product manual or CSR report</div>
+                <div className="text-[12px] font-medium text-stone-700">
+                  {uploadedFile ? (
+                    <span className="text-emerald-700">✓ {uploadedFile.name}</span>
+                  ) : (
+                    'Upload product manual or CSR report'
+                  )}
+                </div>
                 <div className="text-[10px] text-stone-400">PDFs only (max 10MB)</div>
               </div>
             </div>
@@ -359,10 +463,23 @@ export function ConsumerSearch() {
                     Brand <span className="text-stone-900">{resolved.brand}</span> · Owned by <span className="text-stone-900">{resolved.parent}</span> · ABN {resolved.abn}
                   </div>
 
-                  <div className="mt-2"><Confidence value={resolved.score} /></div>
+                  {/* FIX Bug 1: confidence value is now correctly the resolution confidence,
+                      not the biodiversity score */}
+                  <div className="mt-2"><Confidence value={resolved.confidence} /></div>
                 </div>
 
-                <button onClick={() => navigate('/app/overview')} className="inline-flex items-center gap-1.5 px-3.5 h-9 bg-stone-900 hover:bg-stone-800 text-white rounded-lg text-sm">
+                {/* FIX Bug 5: pass query_id and resolved data as route state to CompanyOverview */}
+                <button
+                  onClick={() =>
+                    navigate('/app/overview', {
+                      state: {
+                        query_id: localStorage.getItem('query_id'),
+                        resolved,
+                      },
+                    })
+                  }
+                  className="inline-flex items-center gap-1.5 px-3.5 h-9 bg-stone-900 hover:bg-stone-800 text-white rounded-lg text-sm"
+                >
                   View full report <ArrowRight size={14} />
                 </button>
               </div>
@@ -372,12 +489,14 @@ export function ConsumerSearch() {
               <Card className="p-6 md:col-span-1">
                 <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-stone-400 mb-2">Biodiversity score</div>
                 <div className="flex items-end gap-2">
-                  <div className="text-[64px] leading-none tracking-tight text-amber-600">{resolved.score}</div>
+                  {/* FIX Bug 1: display biodiversityScore, not the old misnamed 'score' */}
+                  <div className="text-[64px] leading-none tracking-tight text-amber-600">{resolved.biodiversityScore}</div>
                   <div className="text-stone-500 mb-2">/100</div>
                 </div>
-                <div className="mt-2"><RiskBadge level="Medium" /></div>
+                {/* FIX Bug 4: RiskBadge level is now dynamically derived from biodiversityScore */}
+                <div className="mt-2"><RiskBadge level={getRiskLevel(resolved.biodiversityScore)} /></div>
                 <div className="mt-4 h-2 bg-stone-100 rounded-full overflow-hidden">
-                  <div className="h-full bg-gradient-to-r from-emerald-500 via-amber-400 to-rose-500" style={{ width: `${resolved.score}%` }} />
+                  <div className="h-full bg-gradient-to-r from-emerald-500 via-amber-400 to-rose-500" style={{ width: `${resolved.biodiversityScore}%` }} />
                 </div>
                 <div className="mt-2 flex justify-between text-[10px] text-stone-400 font-mono">
                   <span>0 · LOW</span><span>50</span><span>100 · CRITICAL</span>
@@ -389,42 +508,60 @@ export function ConsumerSearch() {
                   <ShieldCheck size={16} className="text-emerald-600" />
                   <div className="text-[13px] uppercase tracking-wider text-stone-500">Why this score</div>
                 </div>
-                <ul className="space-y-2.5">
-                  <li className="flex gap-3 text-[13px] text-stone-700"><CircleDot size={14} className="text-amber-500 mt-0.5 shrink-0" />2 processing sites within 5km of RAMSAR wetlands in Victoria.</li>
-                  <li className="flex gap-3 text-[13px] text-stone-700"><CircleDot size={14} className="text-emerald-500 mt-0.5 shrink-0" />Supplier chain disclosed to 3rd tier; 72% of milk from certified farms.</li>
-                  <li className="flex gap-3 text-[13px] text-stone-700"><CircleDot size={14} className="text-orange-500 mt-0.5 shrink-0" />1 open EPBC referral (grazing expansion, NSW) in last 12 months.</li>
-                </ul>
+                {/* FIX Bug 7: risk factors now come from API; show fallback if empty */}
+                {resolved.riskFactors.length > 0 ? (
+                  <ul className="space-y-2.5">
+                    {resolved.riskFactors.map((f, idx) => {
+                      const dotColor =
+                        f.color === 'emerald' ? 'text-emerald-500'
+                        : f.color === 'orange' ? 'text-orange-500'
+                        : f.color === 'rose' ? 'text-rose-500'
+                        : 'text-amber-500';
+                      return (
+                        <li key={idx} className="flex gap-3 text-[13px] text-stone-700">
+                          <CircleDot size={14} className={`${dotColor} mt-0.5 shrink-0`} />
+                          {f.text}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : (
+                  <p className="text-[13px] text-stone-500 italic">No risk factor details returned by the analysis engine.</p>
+                )}
               </Card>
             </div>
 
-            <div>
-              <div className="flex items-end justify-between mb-4">
-                <div>
-                  <div className="flex items-center gap-2 text-[11px] tracking-[0.2em] uppercase text-emerald-700 font-mono mb-1">
-                    <Sparkles size={12} /> § 03 · BETTER CHOICES
+            {/* FIX Bug 7: better choices now come from API response */}
+            {resolved.betterChoices.length > 0 && (
+              <div>
+                <div className="flex items-end justify-between mb-4">
+                  <div>
+                    <div className="flex items-center gap-2 text-[11px] tracking-[0.2em] uppercase text-emerald-700 font-mono mb-1">
+                      <Sparkles size={12} /> § 03 · BETTER CHOICES
+                    </div>
+                    <h2 className="text-[22px] tracking-tight text-stone-900">Kinder to nature, in the same category</h2>
                   </div>
-                  <h2 className="text-[22px] tracking-tight text-stone-900">Kinder to nature, in the same category</h2>
+                  <TrendingUp size={16} className="text-emerald-600" />
                 </div>
-                <TrendingUp size={16} className="text-emerald-600" />
-              </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                {betterChoices.map((b, i) => (
-                  <Card key={b.brand} className="p-5 hover:shadow-md transition">
-                    <div className="font-mono text-[10px] tracking-[0.2em] text-stone-400 mb-2">ALT · 0{i + 1}</div>
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="text-[14px] tracking-tight text-stone-900">{b.brand}</div>
-                      <RiskBadge level={b.level} />
-                    </div>
-                    <div className="flex items-end gap-1 mb-2">
-                      <div className="text-[32px] leading-none tracking-tight text-emerald-700">{b.score}</div>
-                      <div className="text-[11px] text-stone-400 mb-1">score</div>
-                    </div>
-                    <div className="text-[12px] text-stone-600 leading-relaxed">{b.note}</div>
-                  </Card>
-                ))}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {resolved.betterChoices.map((b, i) => (
+                    <Card key={b.brand} className="p-5 hover:shadow-md transition">
+                      <div className="font-mono text-[10px] tracking-[0.2em] text-stone-400 mb-2">ALT · 0{i + 1}</div>
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="text-[14px] tracking-tight text-stone-900">{b.brand}</div>
+                        <RiskBadge level={b.level} />
+                      </div>
+                      <div className="flex items-end gap-1 mb-2">
+                        <div className="text-[32px] leading-none tracking-tight text-emerald-700">{b.score}</div>
+                        <div className="text-[11px] text-stone-400 mb-1">score</div>
+                      </div>
+                      <div className="text-[12px] text-stone-600 leading-relaxed">{b.note}</div>
+                    </Card>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </div>
         )}
       </section>
