@@ -35,7 +35,7 @@ External APIs
 ABR SearchByABN (REST GET):
   GET https://abr.business.gov.au/abrxmlsearch/AbrXmlSearch.asmx/SearchByABNv202001
 
-ABR SearchByName (SOAP POST)  — replaces the broken REST GET endpoint:
+ABR SearchByName (SOAP POST):
   POST https://abr.business.gov.au/ABRXMLSearch/AbrXmlSearch.asmx
   SOAPAction: http://abr.business.gov.au/ABRXMLSearch/ABRSearchByName
 
@@ -223,10 +223,6 @@ def verify_abn_with_abr(abn: str) -> Dict[str, Any]:
 
 # ============================================================
 # ABR Company Name Search  (SOAP POST — ABRSearchByName)
-#
-# The previous REST GET endpoint (ABRSearchByNameAdvancedSimpleProtocol2017)
-# returns HTTP 500.  The SOAP endpoint is the supported alternative.
-# Reference: abn_trial.py (confirmed working with the project GUID).
 # ============================================================
 
 _ABR_SOAP_URL    = "https://abr.business.gov.au/ABRXMLSearch/AbrXmlSearch.asmx"
@@ -237,8 +233,14 @@ def _build_name_search_soap_body(name: str, guid: str) -> str:
     """
     Build the SOAP 1.1 envelope for ABRSearchByName.
 
-    Searches legal names and trading names across all Australian
-    states and territories.
+    Structure matches the confirmed working reference (abn_trial.py):
+
+    - ABRSearchByName uses default namespace xmlns= (no abr: prefix inside body)
+    - authenticationGUID (uppercase) is inside <externalNameSearch>
+    - nameType is nested INSIDE <filters>, not a sibling of it
+    - A second <authenticationGuid> (lowercase d) sits directly under
+      <ABRSearchByName> as required by the WSDL
+    - No <postcode> element; no state-level filter children
     """
     # XML-escape the name to prevent injection.
     safe_name = (
@@ -250,31 +252,23 @@ def _build_name_search_soap_body(name: str, guid: str) -> str:
         .replace("'", "&apos;")
     )
     return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope
-    xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-    xmlns:abr="http://abr.business.gov.au/ABRXMLSearch/">
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <abr:ABRSearchByName>
-      <abr:externalNameSearch>
-        <abr:authenticationGuid>{guid}</abr:authenticationGuid>
-        <abr:name>{safe_name}</abr:name>
-        <abr:postcode></abr:postcode>
-        <abr:nameType>
-          <abr:tradingName>Y</abr:tradingName>
-          <abr:legalName>Y</abr:legalName>
-        </abr:nameType>
-        <abr:filters>
-          <abr:NSW>Y</abr:NSW>
-          <abr:SA>Y</abr:SA>
-          <abr:ACT>Y</abr:ACT>
-          <abr:VIC>Y</abr:VIC>
-          <abr:WA>Y</abr:WA>
-          <abr:NT>Y</abr:NT>
-          <abr:QLD>Y</abr:QLD>
-          <abr:TAS>Y</abr:TAS>
-        </abr:filters>
-      </abr:externalNameSearch>
-    </abr:ABRSearchByName>
+    <ABRSearchByName xmlns="http://abr.business.gov.au/ABRXMLSearch/">
+      <externalNameSearch>
+        <authenticationGUID>{guid}</authenticationGUID>
+        <name>{safe_name}</name>
+        <filters>
+          <nameType>
+            <tradingName>Y</tradingName>
+            <legalName>Y</legalName>
+          </nameType>
+        </filters>
+      </externalNameSearch>
+      <authenticationGuid>{guid}</authenticationGuid>
+    </ABRSearchByName>
   </soap:Body>
 </soap:Envelope>"""
 
@@ -289,13 +283,6 @@ def _parse_soap_name_response(
     Navigates: Envelope > Body > ABRSearchByNameResponse
                 > ABRSearchByNameResult > response > businessEntity202001[]
 
-    Each businessEntity202001 contains:
-      ABN/identifierValue, ABN/identifierStatus,
-      entityType/entityTypeCode + entityDescription,
-      mainName/organisationName (legal name),
-      mainTradingName/organisationName,
-      mainBusinessPhysicalAddress/stateCode + postcode
-
     Returns a list of normalised result dicts.
     """
     try:
@@ -303,17 +290,13 @@ def _parse_soap_name_response(
     except ET.ParseError as e:
         return {"success": False, "message": f"SOAP XML parse error: {e}", "results": []}
 
-    # Check for ABR-level exception inside the response.
     err = _check_abr_exception(root)
     if err:
         return {"success": False, "message": err, "results": []}
 
-    # businessEntity202001 elements can appear at any nesting level inside the
-    # SOAP envelope depending on whether the namespace prefix is used.
+    # businessEntity202001 can appear with or without the namespace prefix
+    # depending on how the server serialises the SOAP response.
     entities = root.findall(".//abr:businessEntity202001", _ABR_NS)
-
-    # Some ABR responses omit the namespace prefix on businessEntity202001.
-    # Try unqualified tag as a fallback.
     if not entities:
         entities = root.findall(".//businessEntity202001")
 
@@ -324,8 +307,7 @@ def _parse_soap_name_response(
     seen_abns: set        = set()
 
     for entity in entities:
-        # ---- ABN value and status ----
-        abn_val    = (
+        abn_val = (
             _text(entity, "abr:ABN/abr:identifierValue")
             or _text(entity, ".//abr:identifierValue")
         )
@@ -339,7 +321,6 @@ def _parse_soap_name_response(
             continue
         seen_abns.add(abn_val)
 
-        # ---- Legal / organisation name ----
         legal_name = (
             _text(entity, "abr:mainName/abr:organisationName")
             or _text(entity, ".//abr:organisationName")
@@ -349,10 +330,8 @@ def _parse_soap_name_response(
             family = _text(entity, ".//abr:familyName")
             legal_name = " ".join(filter(None, [given, family])) or company_name
 
-        # ---- Trading name (optional extra context) ----
         trading_name = _text(entity, "abr:mainTradingName/abr:organisationName")
 
-        # ---- Entity type ----
         entity_type = (
             _text(entity, "abr:entityType/abr:entityDescription")
             or _text(entity, ".//abr:entityDescription")
@@ -360,7 +339,6 @@ def _parse_soap_name_response(
             or _text(entity, ".//abr:entityTypeCode")
         )
 
-        # ---- Address ----
         state = (
             _text(entity, "abr:mainBusinessPhysicalAddress/abr:stateCode")
             or _text(entity, ".//abr:stateCode")
@@ -388,16 +366,7 @@ def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
     """
     Search ABR by company or business name using the SOAP POST endpoint.
 
-    Replaces the broken REST GET (ABRSearchByNameAdvancedSimpleProtocol2017).
-    Uses ABRSearchByName SOAP action as demonstrated in abn_trial.py.
-
     Returns the best Active match plus all deduplicated results.
-
-    Used by:
-    - run_company_phase()           (company name branch of /api/search)
-    - barcode_pipeline.py           (passed in as abr_lookup_fn)
-    - brand_pipeline.py             (passed in as abr_lookup_fn)
-    - /api/company/search/:name    (standalone endpoint in main.py)
     """
     guid = os.getenv("ABR_GUID", "").strip()
     if not guid:
@@ -442,7 +411,6 @@ def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
         }
 
     results = parsed["results"]
-
     if not results:
         return {
             "success":     False,
@@ -452,7 +420,6 @@ def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
             "total":       0,
         }
 
-    # Prefer first Active entity with a verified ABN.
     best = next(
         (r for r in results if r.get("abn_status", "").lower() == "active" and r["abn"]),
         results[0],
@@ -473,11 +440,7 @@ def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
 # ============================================================
 
 def run_abn_phase(abn: str) -> Dict[str, Any]:
-    """
-    Full ABN input pipeline.
-
-    Steps: format check -> checksum (mod-89) -> ABR ABN lookup.
-    """
+    """Full ABN input pipeline: format check -> checksum -> ABR lookup."""
     pipeline: List[str] = []
     errors:   List[str] = []
 
@@ -554,11 +517,7 @@ def run_abn_phase(abn: str) -> Dict[str, Any]:
 
 
 def run_company_phase(company_name: str) -> Dict[str, Any]:
-    """
-    Full company name input pipeline.
-
-    Steps: name validation -> ABR name search (SOAP POST).
-    """
+    """Full company name pipeline: validation -> ABR name search (SOAP POST)."""
     pipeline: List[str] = []
     errors:   List[str] = []
 
@@ -596,11 +555,11 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
     best = abr.get("best_match", {})
 
     confidence = 0
-    if best.get("abn"):                        confidence += 30
-    if best.get("abn_status", "").lower() == "active": confidence += 40
-    elif best.get("abn_status"):               confidence += 15
-    if best.get("legal_name"):                 confidence += 20
-    if abr.get("total", 0) == 1:               confidence += 10
+    if best.get("abn"):                                    confidence += 30
+    if best.get("abn_status", "").lower() == "active":     confidence += 40
+    elif best.get("abn_status"):                           confidence += 15
+    if best.get("legal_name"):                             confidence += 20
+    if abr.get("total", 0) == 1:                           confidence += 10
 
     return {
         "success":      True,
@@ -625,7 +584,7 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
 
 def run_company_abn_phase(value: str) -> Dict[str, Any]:
     """
-    Auto-detect ABN vs company name and dispatch to the right pipeline.
+    Auto-detect ABN vs company name and dispatch.
 
     - 11 digits (after whitespace removal) -> run_abn_phase()
     - Anything else                        -> run_company_phase()
