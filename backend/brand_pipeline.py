@@ -13,8 +13,12 @@ Brand pipeline flow
       ├─── 1. Validate     ─── minimum length, strip whitespace
       │
       ├─── 2. OAuth token  ─── IP Australia client_credentials flow (cached)
+      │                         Token endpoint  : IP_AUSTRALIA_TOKEN_URL
+      │                         Default         : test.api.ipaustralia.gov.au
       │
       ├─── 3. TM Search    ─── POST /search/quick
+      │                         Trademark URL   : IP_AUSTRALIA_TRADEMARK_URL
+      │                         Default         : production.api.ipaustralia.gov.au
       │                         filters: quickSearchType=WORD, status=REGISTERED
       │                         returns {trademarkIds, count}
       │
@@ -27,15 +31,15 @@ Brand pipeline flow
 
 External APIs
 -------------
-- IP Australia OAuth token (PRODUCTION)
-  POST https://api.ipaustralia.gov.au/public/external-token-api/v1/access_token
+- IP Australia OAuth token  (TEST — IP_AUSTRALIA_TOKEN_URL)
+  POST https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token
 
-- IP Australia Trade Mark Quick Search (PRODUCTION)
+- IP Australia Trade Mark Quick Search  (PRODUCTION — IP_AUSTRALIA_TRADEMARK_URL)
   POST https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/search/quick
   Body: {"query": str, "filters": {"quickSearchType": ["WORD"], "status": ["REGISTERED"]}}
   Response: {"trademarkIds": [...], "count": N, "aggregations": {...}}
 
-- IP Australia Trade Mark Detail (PRODUCTION)
+- IP Australia Trade Mark Detail  (PRODUCTION — IP_AUSTRALIA_TRADEMARK_URL)
   GET  https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trade-mark/{ipRightIdentifier}
   Response: ApiTrademark — key fields:
     number       : str
@@ -44,6 +48,13 @@ External APIs
     statusGroup  : str            ← e.g. "REGISTERED"
     owner        : ApiPartyType[] ← [{name, abn, acnOrArbn, jurisdiction, structuredAddress}]
     goodsAndServices : ApiGoodsServices[]
+
+Environment variables  (set in backend/.env)
+--------------------------------------------
+  IP_AUSTRALIA_CLIENT_ID       your OAuth client id
+  IP_AUSTRALIA_CLIENT_SECRET   your OAuth client secret
+  IP_AUSTRALIA_TOKEN_URL       OAuth token endpoint  (default: test instance)
+  IP_AUSTRALIA_TRADEMARK_URL   Trade Mark Search API (default: production instance)
 
 Usage
 -----
@@ -82,19 +93,39 @@ _TM_STATUS_RANK: Dict[str, int] = {
 # Maximum number of IDs to try before giving up on the detail lookup.
 _TM_DETAIL_MAX_TRIES = 10
 
-# Production base URLs — overridable via .env
-_DEFAULT_TOKEN_URL = "https://api.ipaustralia.gov.au/public/external-token-api/v1/access_token"
+# ---------------------------------------------------------------
+# Confirmed default URLs  (overridable via .env)
+#
+# TOKEN_URL    : TEST     instance  (confirmed)
+# TRADEMARK_URL: PRODUCTION instance (confirmed)
+# ---------------------------------------------------------------
+_DEFAULT_TOKEN_URL = "https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token"
 _DEFAULT_TM_URL    = "https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1"
 
 
 # ============================================================
-# Section 1 — OAuth Token Management
+# Section 1 — URL helpers
+# ============================================================
+
+def _token_url() -> str:
+    """OAuth token endpoint — reads IP_AUSTRALIA_TOKEN_URL from env, falls back to TEST default."""
+    return (os.getenv("IP_AUSTRALIA_TOKEN_URL") or _DEFAULT_TOKEN_URL).strip()
+
+
+def _base_url() -> str:
+    """Trade Mark Search API base — reads IP_AUSTRALIA_TRADEMARK_URL from env, falls back to PRODUCTION default."""
+    return (os.getenv("IP_AUSTRALIA_TRADEMARK_URL") or _DEFAULT_TM_URL).rstrip("/")
+
+
+# ============================================================
+# Section 2 — OAuth Token Management
 # ============================================================
 
 def get_ip_australia_access_token() -> Optional[str]:
     """
     Obtain a cached OAuth 2.0 access token from IP Australia.
     Token is cached in-process and reused until 60 seconds before expiry.
+    Reads token URL from IP_AUSTRALIA_TOKEN_URL env var (default: test instance).
     """
     now = int(time.time())
     if _TOKEN_CACHE["access_token"] and now < int(_TOKEN_CACHE["expires_at"]) - 60:
@@ -107,11 +138,12 @@ def get_ip_australia_access_token() -> Optional[str]:
         print("[brand_pipeline] IP Australia credentials missing in .env")
         return None
 
-    token_url = (os.getenv("IP_AUSTRALIA_TOKEN_URL") or _DEFAULT_TOKEN_URL).strip()
+    url = _token_url()
+    print(f"[brand_pipeline] Fetching OAuth token from: {url}")
 
     try:
         response = requests.post(
-            token_url,
+            url,
             headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
             data={
                 "grant_type":    "client_credentials",
@@ -121,7 +153,7 @@ def get_ip_australia_access_token() -> Optional[str]:
             timeout=20,
         )
         if not response.ok:
-            print(f"[brand_pipeline] Token request failed: HTTP {response.status_code}")
+            print(f"[brand_pipeline] Token request failed: HTTP {response.status_code} — {response.text[:200]}")
             return None
 
         token_data   = response.json()
@@ -129,6 +161,7 @@ def get_ip_australia_access_token() -> Optional[str]:
         expires_in   = int(token_data.get("expires_in", 3600))
 
         if not access_token:
+            print("[brand_pipeline] Token response contained no access_token")
             return None
 
         _TOKEN_CACHE["access_token"] = access_token
@@ -156,17 +189,14 @@ def _get_auth_headers() -> Optional[Dict[str, str]]:
     }
 
 
-def _base_url() -> str:
-    return (os.getenv("IP_AUSTRALIA_TRADEMARK_URL") or _DEFAULT_TM_URL).rstrip("/")
-
-
 # ============================================================
-# Section 2 — Quick Search (returns IDs only)
+# Section 3 — Quick Search (returns IDs only)
 # ============================================================
 
 def _quick_search(brand_name: str) -> Dict[str, Any]:
     """
-    POST /search/quick with WORD + REGISTERED filters.
+    POST {IP_AUSTRALIA_TRADEMARK_URL}/search/quick
+    Filters: WORD + REGISTERED
     Returns {"trademarkIds": [...], "count": N}
     """
     headers = _get_auth_headers()
@@ -186,10 +216,13 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
         },
     }
 
+    print(f"[brand_pipeline] Quick search POST: {url}  query={brand_name!r}")
+
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=20)
 
         if resp.status_code == 401:
+            # Token may have expired mid-request — clear cache and retry once
             _TOKEN_CACHE["access_token"] = None
             _TOKEN_CACHE["expires_at"]   = 0
             headers = _get_auth_headers()
@@ -202,32 +235,28 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
         return {"success": True, "data": resp.json()}
 
     except requests.exceptions.Timeout:
-        return {"success": False, "message": "IP Australia request timed out"}
+        return {"success": False, "message": "IP Australia quick search timed out"}
     except requests.exceptions.RequestException as e:
         return {"success": False, "message": f"IP Australia network error: {e}"}
 
 
 # ============================================================
-# Section 3 — Trademark Detail Lookup
+# Section 4 — Trademark Detail Lookup
 # ============================================================
 
 def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
     """
-    GET /trade-mark/{ipRightIdentifier} → full ApiTrademark record.
-
-    Correct path per the official Swagger spec (api.json):
-        /trade-mark/{ipRightIdentifier}   ← hyphenated, singular
-    NOT:
-        /trademarks/{id}                  ← this was the previous (wrong) path
-
+    GET {IP_AUSTRALIA_TRADEMARK_URL}/trade-mark/{ipRightIdentifier}
+    Returns full ApiTrademark record.
     404 is surfaced as not_found=True so the caller can try the next ID.
     """
     headers = _get_auth_headers()
     if not headers:
         return {"success": False, "message": "No auth token for trademark detail lookup"}
 
-    # FIX: path is /trade-mark/{id}, not /trademarks/{id}
     url = f"{_base_url()}/trade-mark/{trademark_id}"
+    print(f"[brand_pipeline] Detail GET: {url}")
+
     try:
         resp = requests.get(url, headers=headers, timeout=20)
 
@@ -261,10 +290,6 @@ def _fetch_first_available_trademark(
     """
     Walk *ids* in relevance order and return the first detail record that
     resolves successfully (HTTP 200). Skips 404s; stops on any other error.
-
-    Returns:
-        {"success": True,  "data": <record>, "tried": <n>, "id": <str>}
-        {"success": False, "message": <str>,  "tried": <n>}
     """
     skipped: List[str] = []
 
@@ -303,24 +328,21 @@ def _fetch_first_available_trademark(
 
 
 # ============================================================
-# Section 4 — Owner Extraction from Detail Record
+# Section 5 — Owner Extraction from Detail Record
 # ============================================================
 
 def _extract_owner_from_record(record: Dict[str, Any]) -> Optional[str]:
     """
     Extract the legal owner name from an ApiTrademark detail record.
 
-    Per the official Swagger spec (api.json), the correct field is:
+    Per the official Swagger spec (api.json):
         record["owner"]  →  ApiPartyType[]
                             each item: {name, abn, acnOrArbn, jurisdiction, structuredAddress}
-
-    The previous implementation checked non-existent keys like "applicants",
-    "holders", "proprietors" which are not in the API response schema.
     """
     if not isinstance(record, dict):
         return None
 
-    # PRIMARY: owner[] — the canonical field per ApiTrademark schema
+    # PRIMARY: owner[] — canonical field per ApiTrademark schema
     owner_list = record.get("owner")
     if isinstance(owner_list, list) and owner_list:
         first = owner_list[0]
@@ -345,28 +367,27 @@ def _extract_owner_from_record(record: Dict[str, Any]) -> Optional[str]:
 
 def _build_trademark_summary(record: Dict[str, Any], legal_owner: Optional[str]) -> Dict:
     """
-    Flatten an ApiTrademark detail record into the shape the rest of the
-    pipeline expects.
+    Flatten an ApiTrademark record into the shape the pipeline expects.
 
-    Correct field names per api.json ApiTrademark schema:
-      number       → record["number"]
-      words        → record["words"]        (str[] — the word-mark text)
-      statusCode   → record["statusCode"]   (e.g. "Registered")
-      statusGroup  → record["statusGroup"]  (e.g. "REGISTERED")
-      goodsAndServices → record["goodsAndServices"]
+    Field mapping (per api.json ApiTrademark schema):
+      words[]              → word_mark  (str[] joined)
+      statusCode           → status     (e.g. "Registered")
+      statusGroup          → status     (fallback, e.g. "REGISTERED")
+      filingDate /
+        lodgementDate      → filing_date
+      enteredOnRegisterDate→ registration_date
+      goodsAndServices     → goods_services
     """
-    # words[] is the actual word-mark; join multiple elements if present
     words = record.get("words") or []
     word_mark = " ".join(words).strip() if isinstance(words, list) else None
 
-    # statusCode is human-readable ("Registered"); statusGroup is the enum ("REGISTERED")
     status = record.get("statusCode") or record.get("statusGroup")
 
     return {
         "number":            record.get("number"),
         "word_mark":         word_mark or None,
         "status":            status,
-        "filing_date":       record.get("filingDate")       or record.get("lodgementDate"),
+        "filing_date":       record.get("filingDate") or record.get("lodgementDate"),
         "registration_date": record.get("enteredOnRegisterDate"),
         "goods_services":    record.get("goodsAndServices"),
         "legal_owner":       legal_owner,
@@ -374,7 +395,7 @@ def _build_trademark_summary(record: Dict[str, Any], legal_owner: Optional[str])
 
 
 # ============================================================
-# Section 5 — Orchestrated Brand Resolution
+# Section 6 — Orchestrated Brand Resolution
 # ============================================================
 
 def resolve_brand(
@@ -384,10 +405,13 @@ def resolve_brand(
     """
     Full brand name resolution pipeline.
     1. Validate brand_name (minimum 2 characters).
-    2. POST /search/quick (WORD + REGISTERED) → get trademarkIds list.
-    3. Walk IDs until one detail record resolves (skipping 404s).
+    2. POST {TRADEMARK_URL}/search/quick  (WORD + REGISTERED) → trademarkIds.
+    3. Walk IDs — GET {TRADEMARK_URL}/trade-mark/{id} until one resolves.
     4. Extract legal owner from record.owner[] (ApiPartyType[]).
     5. ABR name lookup on extracted owner (if abr_lookup_fn provided).
+
+    Token obtained from IP_AUSTRALIA_TOKEN_URL (test instance by default).
+    Search/detail from IP_AUSTRALIA_TRADEMARK_URL (production instance by default).
     """
     pipeline: List[str] = []
     errors:   List[str] = []
@@ -406,6 +430,9 @@ def resolve_brand(
         }
 
     pipeline.append(f"IP Australia quick search (WORD+REGISTERED): '{brand_name}'")
+    pipeline.append(f"  token_url     : {_token_url()}")
+    pipeline.append(f"  trademark_url : {_base_url()}")
+
     search_resp = _quick_search(brand_name)
 
     if not search_resp.get("success"):
@@ -518,7 +545,7 @@ def _strip_legal_suffix(name: str) -> str:
 
 
 # ============================================================
-# Section 6 — Convenience wrapper for main.py
+# Section 7 — Convenience wrapper for main.py
 # ============================================================
 
 def run_brand_phase(
