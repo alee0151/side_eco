@@ -26,9 +26,7 @@ Company name pipeline flow
       │
       ├─── 1. Name validation  ── minimum 2 characters
       └─── 2. ABR name search  ── ABRSearchByName (SOAP POST)
-                                   deduplicates by ABN
-                                   prefers Active entities
-                                   returns best_match + all_results
+                                   returns first Active result (highest ABR score)
 
 External APIs
 -------------
@@ -38,6 +36,7 @@ ABR SearchByABN (REST GET):
 ABR SearchByName (SOAP POST):
   POST https://abr.business.gov.au/ABRXMLSearch/AbrXmlSearch.asmx
   SOAPAction: http://abr.business.gov.au/ABRXMLSearch/ABRSearchByName
+  Response element: <searchResultsRecord> (NOT businessEntity202001)
 
   NOTE: ABRSearchByNameAdvancedSimpleProtocol2017 (REST GET) returns HTTP 500
         and has been removed.  All name searches now use the SOAP endpoint.
@@ -234,15 +233,11 @@ def _build_name_search_soap_body(name: str, guid: str) -> str:
     Build the SOAP 1.1 envelope for ABRSearchByName.
 
     Structure matches the confirmed working reference (abn_trial.py):
-
-    - ABRSearchByName uses default namespace xmlns= (no abr: prefix inside body)
-    - authenticationGUID (uppercase) is inside <externalNameSearch>
-    - nameType is nested INSIDE <filters>, not a sibling of it
-    - A second <authenticationGuid> (lowercase d) sits directly under
-      <ABRSearchByName> as required by the WSDL
-    - No <postcode> element; no state-level filter children
+    - ABRSearchByName uses default xmlns= (no abr: prefix inside body)
+    - authenticationGUID (uppercase) inside externalNameSearch
+    - nameType nested INSIDE <filters>
+    - Second <authenticationGuid> directly under <ABRSearchByName>
     """
-    # XML-escape the name to prevent injection.
     safe_name = (
         name
         .replace("&", "&amp;")
@@ -280,93 +275,94 @@ def _parse_soap_name_response(
     """
     Parse the SOAP response from ABRSearchByName.
 
-    Navigates: Envelope > Body > ABRSearchByNameResponse
-                > ABRSearchByNameResult > response > businessEntity202001[]
+    ABR returns <searchResultsRecord> elements (confirmed from live response).
+    Only the first Active result (highest ABR relevance score) is returned.
 
-    Returns a list of normalised result dicts.
+    Each <searchResultsRecord> contains:
+      ABN/identifierValue, ABN/identifierStatus,
+      mainName/organisationName  (legal name, with <score>),
+      mainTradingName/organisationName,
+      mainBusinessPhysicalAddress/stateCode + postcode
     """
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as e:
-        return {"success": False, "message": f"SOAP XML parse error: {e}", "results": []}
+        return {"success": False, "message": f"SOAP XML parse error: {e}", "result": None}
 
     err = _check_abr_exception(root)
     if err:
-        return {"success": False, "message": err, "results": []}
+        return {"success": False, "message": err, "result": None}
 
-    # businessEntity202001 can appear with or without the namespace prefix
-    # depending on how the server serialises the SOAP response.
-    entities = root.findall(".//abr:businessEntity202001", _ABR_NS)
-    if not entities:
-        entities = root.findall(".//businessEntity202001")
+    # ABR name search response uses <searchResultsRecord> elements.
+    # Try with namespace prefix first, then unqualified as fallback.
+    records = root.findall(".//abr:searchResultsRecord", _ABR_NS)
+    if not records:
+        records = root.findall(".//searchResultsRecord")
 
-    if not entities:
-        return {"success": False, "message": f"No results for '{company_name}'", "results": []}
+    if not records:
+        return {"success": False, "message": f"No results for '{company_name}'", "result": None}
 
-    results:   List[Dict] = []
-    seen_abns: set        = set()
-
-    for entity in entities:
+    # ABR returns records sorted by relevance score descending.
+    # Walk records and return the first one with Active status.
+    # Fall back to the very first record if none are Active.
+    def _parse_record(record) -> Dict:
         abn_val = (
-            _text(entity, "abr:ABN/abr:identifierValue")
-            or _text(entity, ".//abr:identifierValue")
+            _text(record, "abr:ABN/abr:identifierValue")
+            or _text(record, ".//abr:identifierValue")
         )
         abn_status = (
-            _text(entity, "abr:ABN/abr:identifierStatus")
-            or _text(entity, ".//abr:identifierStatus")
-            or _text(entity, ".//abr:entityStatusCode")
+            _text(record, "abr:ABN/abr:identifierStatus")
+            or _text(record, ".//abr:identifierStatus")
         )
-
-        if abn_val in seen_abns:
-            continue
-        seen_abns.add(abn_val)
-
+        # mainName holds the legal/registered name
         legal_name = (
-            _text(entity, "abr:mainName/abr:organisationName")
-            or _text(entity, ".//abr:organisationName")
+            _text(record, "abr:mainName/abr:organisationName")
+            or _text(record, ".//abr:organisationName")
         )
         if not legal_name:
-            given  = _text(entity, ".//abr:givenName")
-            family = _text(entity, ".//abr:familyName")
+            given  = _text(record, ".//abr:givenName")
+            family = _text(record, ".//abr:familyName")
             legal_name = " ".join(filter(None, [given, family])) or company_name
 
-        trading_name = _text(entity, "abr:mainTradingName/abr:organisationName")
-
-        entity_type = (
-            _text(entity, "abr:entityType/abr:entityDescription")
-            or _text(entity, ".//abr:entityDescription")
-            or _text(entity, ".//abr:entityTypeDescription")
-            or _text(entity, ".//abr:entityTypeCode")
-        )
-
-        state = (
-            _text(entity, "abr:mainBusinessPhysicalAddress/abr:stateCode")
-            or _text(entity, ".//abr:stateCode")
+        trading_name = _text(record, "abr:mainTradingName/abr:organisationName")
+        state        = (
+            _text(record, "abr:mainBusinessPhysicalAddress/abr:stateCode")
+            or _text(record, ".//abr:stateCode")
         )
         postcode = (
-            _text(entity, "abr:mainBusinessPhysicalAddress/abr:postcode")
-            or _text(entity, ".//abr:postcode")
+            _text(record, "abr:mainBusinessPhysicalAddress/abr:postcode")
+            or _text(record, ".//abr:postcode")
         )
-
-        results.append({
+        return {
             "abn":          abn_val,
             "legal_name":   legal_name,
             "trading_name": trading_name,
-            "entity_type":  entity_type,
+            "entity_type":  None,   # not present in name search results; populated by ABN lookup
             "state":        state,
             "postcode":     postcode,
             "abn_status":   abn_status,
             "verified":     abn_val is not None,
-        })
+        }
 
-    return {"success": True, "results": results}
+    # First pass: first Active record
+    for record in records:
+        status = (
+            _text(record, "abr:ABN/abr:identifierStatus")
+            or _text(record, ".//abr:identifierStatus")
+            or ""
+        )
+        if status.lower() == "active":
+            return {"success": True, "result": _parse_record(record)}
+
+    # Fallback: highest-scored record regardless of status
+    return {"success": True, "result": _parse_record(records[0])}
 
 
 def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
     """
     Search ABR by company or business name using the SOAP POST endpoint.
 
-    Returns the best Active match plus all deduplicated results.
+    Returns the single best Active result (highest ABR relevance score).
     """
     guid = os.getenv("ABR_GUID", "").strip()
     if not guid:
@@ -401,37 +397,19 @@ def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
 
     parsed = _parse_soap_name_response(resp.text, company_name)
 
-    if not parsed["success"]:
+    if not parsed["success"] or not parsed.get("result"):
         return {
-            "success":     False,
-            "source":      "ABR",
-            "message":     parsed.get("message", "ABR name search failed"),
-            "all_results": [],
-            "total":       0,
+            "success": False,
+            "source":  "ABR",
+            "message": parsed.get("message", "ABR name search returned no results"),
         }
 
-    results = parsed["results"]
-    if not results:
-        return {
-            "success":     False,
-            "source":      "ABR",
-            "message":     f"No company found in ABR for '{company_name}'",
-            "all_results": [],
-            "total":       0,
-        }
-
-    best = next(
-        (r for r in results if r.get("abn_status", "").lower() == "active" and r["abn"]),
-        results[0],
-    )
-
+    match = parsed["result"]
     return {
-        "success":     True,
-        "source":      "ABR",
-        **best,
-        "best_match":  best,
-        "all_results": results,
-        "total":       len(results),
+        "success":    True,
+        "source":     "ABR",
+        "best_match": match,
+        **match,
     }
 
 
@@ -542,8 +520,6 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
             "success":      False,
             "company_name": company_name,
             "company":      None,
-            "all_results":  abr.get("all_results", []),
-            "total":        abr.get("total", 0),
             "source":       "ABR",
             "error":        abr.get("message", "ABR search failed"),
             "status":       "not_found",
@@ -559,7 +535,6 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
     if best.get("abn_status", "").lower() == "active":     confidence += 40
     elif best.get("abn_status"):                           confidence += 15
     if best.get("legal_name"):                             confidence += 20
-    if abr.get("total", 0) == 1:                           confidence += 10
 
     return {
         "success":      True,
@@ -572,13 +547,11 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
             "postcode":    best.get("postcode"),
             "abn_status":  best.get("abn_status"),
         },
-        "all_results":  abr.get("all_results", []),
-        "total":        abr.get("total", 0),
-        "source":       "ABR",
-        "status":       "external_resolved" if best.get("abn_status", "").lower() == "active" else "external_found",
-        "confidence":   min(confidence, 100),
-        "pipeline":     pipeline,
-        "errors":       errors,
+        "source":     "ABR",
+        "status":     "external_resolved" if best.get("abn_status", "").lower() == "active" else "external_found",
+        "confidence": min(confidence, 100),
+        "pipeline":   pipeline,
+        "errors":     errors,
     }
 
 
