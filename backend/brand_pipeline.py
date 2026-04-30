@@ -19,7 +19,6 @@ Brand pipeline flow
       │                         returns {trademarkIds, count}
       │
       ├─── 4. TM Detail    ─── GET /trademarks/{id} — walks IDs until one resolves
-      │                         (test env only has a subset of records)
       │
       ├─── 5. Owner pick   ─── extract applicant / owner name from detail record
       │
@@ -27,17 +26,16 @@ Brand pipeline flow
 
 External APIs
 -------------
-- IP Australia OAuth token
-  POST https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token
+- IP Australia OAuth token (PRODUCTION)
+  POST https://api.ipaustralia.gov.au/public/external-token-api/v1/access_token
 
-- IP Australia Trade Mark Quick Search (returns IDs only)
-  POST https://test.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/search/quick
+- IP Australia Trade Mark Quick Search (PRODUCTION)
+  POST https://api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/search/quick
   Body: {"query": str, "filters": {"quickSearchType": ["WORD"], "status": ["REGISTERED"]}}
   Response: {"trademarkIds": [...], "count": N, "aggregations": {...}}
 
-- IP Australia Trade Mark Detail (returns full record)
-  GET  https://test.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trademarks/{id}
-  NOTE: test env only contains a subset of records; 404 means try next ID.
+- IP Australia Trade Mark Detail (PRODUCTION)
+  GET  https://api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trademarks/{id}
 
 Usage
 -----
@@ -74,9 +72,11 @@ _TM_STATUS_RANK: Dict[str, int] = {
 }
 
 # Maximum number of IDs to try before giving up on the detail lookup.
-# The test environment has a sparse record set so we may need to skip
-# several 404s before landing on a record that actually exists.
 _TM_DETAIL_MAX_TRIES = 10
+
+# Production base URLs — overridable via .env
+_DEFAULT_TOKEN_URL = "https://api.ipaustralia.gov.au/public/external-token-api/v1/access_token"
+_DEFAULT_TM_URL    = "https://api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1"
 
 
 # ============================================================
@@ -99,12 +99,7 @@ def get_ip_australia_access_token() -> Optional[str]:
         print("[brand_pipeline] IP Australia credentials missing in .env")
         return None
 
-    token_url = (
-        os.getenv(
-            "IP_AUSTRALIA_TOKEN_URL",
-            "https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token",
-        ) or ""
-    ).strip()
+    token_url = (os.getenv("IP_AUSTRALIA_TOKEN_URL") or _DEFAULT_TOKEN_URL).strip()
 
     try:
         response = requests.post(
@@ -154,12 +149,7 @@ def _get_auth_headers() -> Optional[Dict[str, str]]:
 
 
 def _base_url() -> str:
-    return (
-        os.getenv(
-            "IP_AUSTRALIA_TRADEMARK_URL",
-            "https://test.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1",
-        ) or ""
-    ).rstrip("/")
+    return (os.getenv("IP_AUSTRALIA_TRADEMARK_URL") or _DEFAULT_TM_URL).rstrip("/")
 
 
 # ============================================================
@@ -169,10 +159,6 @@ def _base_url() -> str:
 def _quick_search(brand_name: str) -> Dict[str, Any]:
     """
     POST /search/quick with WORD + REGISTERED filters.
-
-    Filters applied:
-      quickSearchType: ["WORD"]       — exact word-mark match only
-      status:          ["REGISTERED"] — only live, registered trademarks
     """
     headers = _get_auth_headers()
     if not headers:
@@ -219,8 +205,7 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
 def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
     """
     GET /trademarks/{id} → full trademark record.
-    Returns the full record dict or an error dict on failure.
-    404 is surfaced as success=False so callers can try the next ID.
+    404 is surfaced as not_found=True so the caller can try the next ID.
     """
     headers = _get_auth_headers()
     if not headers:
@@ -259,13 +244,7 @@ def _fetch_first_available_trademark(
 ) -> Dict[str, Any]:
     """
     Walk *ids* in relevance order and return the first detail record that
-    resolves successfully (HTTP 200).
-
-    The test environment (test.api.ipaustralia.gov.au) only mirrors a
-    subset of live trademark records.  Requesting an ID that isn’t in the
-    test dataset returns {"message": "Resource not found"} (HTTP 404).
-    Rather than failing immediately, this helper skips 404s and keeps
-    trying until it either finds a record or exhausts *max_tries*.
+    resolves successfully (HTTP 200). Skips 404s; stops on any other error.
 
     Returns:
         {"success": True,  "data": <record>, "tried": <n>, "id": <str>}
@@ -286,7 +265,6 @@ def _fetch_first_available_trademark(
                 "id":      tm_id,
             }
 
-        # Only skip on 404; any other error (timeout, 5xx) is terminal.
         if resp.get("not_found"):
             skipped.append(tm_id)
             continue
@@ -301,8 +279,8 @@ def _fetch_first_available_trademark(
     return {
         "success": False,
         "message": (
-            f"None of the first {max_tries} trademark IDs returned a valid record "
-            f"(all 404 in the test environment). IDs tried: {skipped}"
+            f"None of the first {max_tries} trademark IDs returned a valid record. "
+            f"IDs tried: {skipped}"
         ),
         "tried": len(skipped),
     }
@@ -313,10 +291,7 @@ def _fetch_first_available_trademark(
 # ============================================================
 
 def _extract_owner_from_record(record: Dict[str, Any]) -> Optional[str]:
-    """
-    Extract the legal owner / applicant name from a trademark detail record.
-    Priority: applicants > owners > holders > proprietors > singular forms > flat keys.
-    """
+    """Extract the legal owner / applicant name from a trademark detail record."""
     def first_name_from_list(lst: Any) -> Optional[str]:
         if not isinstance(lst, list) or not lst:
             return None
@@ -381,9 +356,6 @@ def resolve_brand(
 ) -> Dict[str, Any]:
     """
     Full brand name resolution pipeline.
-
-    Steps
-    -----
     1. Validate brand_name (minimum 2 characters).
     2. POST /search/quick (WORD + REGISTERED) → get trademarkIds list.
     3. Walk IDs until one detail record resolves (skipping 404s).
@@ -395,7 +367,6 @@ def resolve_brand(
 
     brand_name = (brand_name or "").strip()
 
-    # Step 1 — Validate
     pipeline.append("Brand name validation")
     if len(brand_name) < 2:
         return {
@@ -407,7 +378,6 @@ def resolve_brand(
             "confidence": 0,
         }
 
-    # Step 2 — Quick search
     pipeline.append(f"IP Australia quick search (WORD+REGISTERED): '{brand_name}'")
     search_resp = _quick_search(brand_name)
 
@@ -442,7 +412,6 @@ def resolve_brand(
             "confidence":  0,
         }
 
-    # Step 3 — Walk IDs until one detail record resolves
     pipeline.append(f"Fetch trademark detail (up to {_TM_DETAIL_MAX_TRIES} tries) from {total_ids} results")
     detail_resp = _fetch_first_available_trademark(ids)
 
@@ -469,7 +438,6 @@ def resolve_brand(
     legal_owner = _extract_owner_from_record(record)
     trademark   = _build_trademark_summary(record, legal_owner)
 
-    # Step 4 — ABR lookup (optional)
     abr_result: Optional[Dict[str, Any]] = None
 
     if abr_lookup_fn and legal_owner:
@@ -482,7 +450,6 @@ def resolve_brand(
                 pipeline.append(f"ABR retry with short name: '{short_name}'")
                 abr_result = abr_lookup_fn(short_name)
 
-    # Confidence scoring
     confidence = 0
     if resolved_id:                                                      confidence += 20
     if str(trademark.get("status") or "").lower() == "registered":       confidence += 30
