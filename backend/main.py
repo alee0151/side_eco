@@ -40,8 +40,16 @@ Main endpoint
 -------------
 POST /api/search
 
+Diagnostic endpoints
+--------------------
+GET /api/debug/trademark-auth
+    Runs the IP Australia OAuth token fetch in isolation and reports
+    which method succeeded (Basic Auth header vs body params).
+    Use this to validate .env credentials WITHOUT running a full search.
+
 Version history
 ---------------
+5.1.0 - /api/debug/trademark-auth added; diagnose_token() imported
 5.0.0 - abn_pipeline.py extracted; ABR functions removed from main.py
 4.0.0 - barcode and brand logic moved to dedicated pipeline modules
 3.0.0 - initial pipeline implementation
@@ -72,7 +80,7 @@ from abn_pipeline import (
     is_abn,
 )
 from barcode_pipeline import run_barcode_phase
-from brand_pipeline import run_brand_phase, get_ip_australia_access_token
+from brand_pipeline import run_brand_phase, get_ip_australia_access_token, diagnose_token
 
 
 # ============================================================
@@ -88,7 +96,7 @@ load_dotenv()
 
 app = FastAPI(
     title="EcoTrace Backend API",
-    version="5.0.0",
+    version="5.1.0",
     description="""
 EcoTrace consumer search API.
 
@@ -287,7 +295,7 @@ def root():
         "message":       "EcoTrace backend is running",
         "main_endpoint": "POST /api/search",
         "consumer_flow": "query_id based, no login required",
-        "version":       "5.0.0",
+        "version":       "5.1.0",
     }
 
 
@@ -494,6 +502,27 @@ def search_entity(payload: SearchRequest):
 # ============================================================
 # Standalone Test / Diagnostic Endpoints
 # ============================================================
+
+@app.get("/api/debug/trademark-auth")
+def debug_trademark_auth():
+    """
+    Diagnose IP Australia OAuth configuration.
+
+    Tries both authentication methods and reports:
+    - Whether credentials are set in .env
+    - Which token URL is in use
+    - Which method succeeded (Basic Auth header vs body params)
+    - The HTTP status code returned by the token endpoint
+    - A human-readable error if both methods fail
+
+    Use this endpoint FIRST when the brand pipeline returns
+    'Unable to obtain IP Australia OAuth token'.
+
+    Example:
+        curl http://localhost:8000/api/debug/trademark-auth
+    """
+    return diagnose_token()
+
 
 @app.get("/api/abn/verify/{abn}")
 def verify_abn_endpoint(abn: str):
