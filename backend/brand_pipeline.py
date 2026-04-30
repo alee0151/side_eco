@@ -14,11 +14,12 @@ Brand pipeline flow
       │
       ├─── 2. OAuth token  ─── IP Australia client_credentials flow (cached)
       │
-      ├─── 3. TM Search    ─── POST /search/quick → returns {trademarkIds, count}
-      │                           NOTE: quick search returns IDs only, not full records
+      ├─── 3. TM Search    ─── POST /search/quick
+      │                         filters: quickSearchType=WORD, status=REGISTERED
+      │                         returns {trademarkIds, count}
       │
       ├─── 4. TM Detail    ─── GET /trademarks/{id} for the first (best) ID
-      │                           returns full record: owner, status, wordMark, etc.
+      │                         returns full record: owner, status, wordMark, etc.
       │
       ├─── 5. Owner pick   ─── extract applicant / owner name from detail record
       │
@@ -31,7 +32,8 @@ External APIs
 
 - IP Australia Trade Mark Quick Search (returns IDs only)
   POST https://test.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/search/quick
-  Response: {"trademarkIds": ["123", ...], "count": N, "aggregations": {...}}
+  Body: {"query": str, "filters": {"quickSearchType": ["WORD"], "status": ["REGISTERED"]}}
+  Response: {"trademarkIds": [...], "count": N, "aggregations": {...}}
 
 - IP Australia Trade Mark Detail (returns full record)
   GET  https://test.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trademarks/{id}
@@ -160,10 +162,17 @@ def _base_url() -> str:
 
 def _quick_search(brand_name: str) -> Dict[str, Any]:
     """
-    POST /search/quick → {"trademarkIds": [...], "count": N, "aggregations": {...}}
+    POST /search/quick with WORD + REGISTERED filters.
 
-    Returns the raw response dict.  The caller must then fetch a detail
-    record for whichever ID it wants to use.
+    Filters applied:
+      quickSearchType: ["WORD"]       — exact word-mark match only (excludes NAME matches)
+      status:          ["REGISTERED"] — only live, registered trademarks
+
+    Without filters, a query like 'arnott' returns 799 IDs (789 NAME + REMOVED).
+    With these two filters the result set shrinks to the handful of active word marks.
+
+    Returns the raw response dict. The caller fetches a detail record for
+    whichever ID it wants to use.
     """
     headers = _get_auth_headers()
     if not headers:
@@ -173,9 +182,17 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
                        "Check IP_AUSTRALIA_CLIENT_ID and IP_AUSTRALIA_CLIENT_SECRET in .env.",
         }
 
-    url = f"{_base_url()}/search/quick"
+    url  = f"{_base_url()}/search/quick"
+    body = {
+        "query": brand_name,
+        "filters": {
+            "quickSearchType": ["WORD"],
+            "status":          ["REGISTERED"],
+        },
+    }
+
     try:
-        resp = requests.post(url, headers=headers, json={"query": brand_name}, timeout=20)
+        resp = requests.post(url, headers=headers, json=body, timeout=20)
 
         if resp.status_code == 401:
             # Token expired mid-flight — clear cache and retry once.
@@ -183,7 +200,7 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
             _TOKEN_CACHE["expires_at"]   = 0
             headers = _get_auth_headers()
             if headers:
-                resp = requests.post(url, headers=headers, json={"query": brand_name}, timeout=20)
+                resp = requests.post(url, headers=headers, json=body, timeout=20)
 
         if not resp.ok:
             return {"success": False, "status_code": resp.status_code, "message": resp.text[:500]}
@@ -238,13 +255,10 @@ def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
 
 def _pick_best_trademark_id(search_data: Dict[str, Any]) -> Optional[str]:
     """
-    Choose the best trademark ID from a quick-search response.
+    Return the first trademark ID from a quick-search response.
 
-    Strategy:
-    - The quick search response includes aggregations.status counts.
-    - The trademarkIds list is ordered by relevance (highest score first).
-    - We simply return the first ID; the list is already relevance-ranked
-      by IP Australia and the detail fetch will confirm the status.
+    Because the request already filters to REGISTERED + WORD marks,
+    the first ID is the highest-relevance registered word-mark result.
     """
     ids = search_data.get("trademarkIds") or []
     if not ids:
@@ -332,7 +346,7 @@ def resolve_brand(
     Steps
     -----
     1. Validate brand_name (minimum 2 characters).
-    2. POST /search/quick → get trademarkIds list.
+    2. POST /search/quick (WORD + REGISTERED) → get trademarkIds list.
     3. Pick first (most relevant) trademark ID.
     4. GET /trademarks/{id} → full trademark detail record.
     5. Extract legal owner from detail record.
@@ -355,8 +369,8 @@ def resolve_brand(
             "confidence": 0,
         }
 
-    # Step 2 — Quick search (IDs only)
-    pipeline.append(f"IP Australia quick search: '{brand_name}'")
+    # Step 2 — Quick search (WORD + REGISTERED, IDs only)
+    pipeline.append(f"IP Australia quick search (WORD+REGISTERED): '{brand_name}'")
     search_resp = _quick_search(brand_name)
 
     if not search_resp.get("success"):
@@ -377,14 +391,14 @@ def resolve_brand(
     total_ids   = search_data.get("count", 0)
 
     # Step 3 — Pick best ID
-    pipeline.append(f"Select best trademark ID from {total_ids} results")
+    pipeline.append(f"Select best trademark ID from {total_ids} filtered results")
     best_id = _pick_best_trademark_id(search_data)
 
     if not best_id:
         return {
             "success":     False,
             "brand_name":  brand_name,
-            "error":       f"No trademarks found for '{brand_name}'",
+            "error":       f"No registered word-mark trademarks found for '{brand_name}'",
             "trademark":   None,
             "legal_owner": None,
             "abr":         None,
@@ -400,7 +414,6 @@ def resolve_brand(
     if not detail_resp.get("success"):
         msg = detail_resp.get("message", f"Could not fetch trademark {best_id}")
         errors.append(msg)
-        # Non-fatal: we still know a trademark exists; report partial result.
         return {
             "success":     False,
             "brand_name":  brand_name,
@@ -411,7 +424,7 @@ def resolve_brand(
             "tm_total":    total_ids,
             "pipeline":    pipeline,
             "errors":      errors,
-            "confidence":  10,   # at least we know the brand has TM records
+            "confidence":  10,
         }
 
     record      = detail_resp["data"]
