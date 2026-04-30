@@ -23,13 +23,29 @@ Only ONE input type should be submitted per request:
 
 Pipeline modules
 ----------------
-  barcode_pipeline.py  : EAN-13 checksum -> OpenFoodFacts -> GS1 fallback -> ABR
+  barcode_pipeline.py  : EAN-13 checksum -> OpenFoodFacts -> IP Australia TM -> ABR
   brand_pipeline.py    : IP Australia Trade Mark Search -> ABR
   abn_pipeline.py      : ABN checksum (ATO mod-89) -> ABR ABN lookup
                          OR company name -> ABR name search
 
 All ABR Web Services calls live in abn_pipeline.py.
 Barcode and brand pipelines receive abr_lookup_fn as a dependency.
+
+DB writes (db_writer.py)
+------------------------
+After each pipeline succeeds the following rows are upserted:
+
+  company/ABN branch:
+    abn_record, company
+    -> search_query.resolved_company_id
+
+  brand branch:
+    abn_record, company, trademark, brand
+    -> search_query.resolved_company_id + resolved_brand_id
+
+  barcode branch:
+    abn_record, company, trademark, brand, product
+    -> search_query.resolved_company_id + resolved_brand_id + resolved_product_id
 
 Not included in this file
 -------------------------
@@ -49,6 +65,7 @@ GET /api/debug/trademark-auth
 
 Version history
 ---------------
+6.0.0 - db_writer.py added; all 3 pipeline branches now persist to DB
 5.1.0 - /api/debug/trademark-auth added; diagnose_token() imported
 5.0.0 - abn_pipeline.py extracted; ABR functions removed from main.py
 4.0.0 - barcode and brand logic moved to dedicated pipeline modules
@@ -68,9 +85,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ------------------------------------------------------------------
-# Pipeline modules — one file per input type.
-# All ABR Web Services calls live in abn_pipeline; brand and barcode
-# pipelines receive search_company_name_with_abr as a dependency.
+# Pipeline modules
 # ------------------------------------------------------------------
 from abn_pipeline import (
     run_company_abn_phase,
@@ -81,6 +96,17 @@ from abn_pipeline import (
 )
 from barcode_pipeline import run_barcode_phase
 from brand_pipeline import run_brand_phase, get_ip_australia_access_token, diagnose_token
+
+# ------------------------------------------------------------------
+# DB write helpers
+# ------------------------------------------------------------------
+from db_writer import (
+    upsert_company,
+    upsert_trademark,
+    upsert_brand,
+    upsert_product,
+    extract_abr_data,
+)
 
 
 # ============================================================
@@ -96,15 +122,16 @@ load_dotenv()
 
 app = FastAPI(
     title="EcoTrace Backend API",
-    version="5.1.0",
+    version="6.0.0",
     description="""
 EcoTrace consumer search API.
 
 Pipeline modules:
 - abn_pipeline.py     : ABN checksum (ATO mod-89) + ABR lookup / name search
-- barcode_pipeline.py : EAN-13 validation -> OpenFoodFacts -> GS1 -> ABR
+- barcode_pipeline.py : EAN-13 validation -> OpenFoodFacts -> IP Australia TM -> ABR
 - brand_pipeline.py   : IP Australia Trade Mark Search -> ABR
 
+db_writer.py upserts pipeline results into the database after each search.
 Every valid search creates a query_id and stores one search_query record.
 """
 )
@@ -128,12 +155,6 @@ app.add_middleware(
 # ============================================================
 
 def get_conn():
-    """
-    Create a PostgreSQL database connection.
-
-    Required .env variables:
-    - DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
-    """
     return psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=os.getenv("DB_PORT", "5432"),
@@ -145,7 +166,6 @@ def get_conn():
 
 
 def serialize_row(row):
-    """Convert a DB row to a JSON-safe dict (UUID -> str)."""
     if row is None:
         return None
     return {k: str(v) if isinstance(v, UUID) else v for k, v in row.items()}
@@ -156,17 +176,6 @@ def serialize_row(row):
 # ============================================================
 
 class SearchRequest(BaseModel):
-    """
-    Main frontend search request.
-
-    Exactly one of barcode, brand, or company_or_abn must be provided.
-
-    Examples:
-        {"barcode": "9310055002440"}
-        {"brand": "Tim Tam"}
-        {"company_or_abn": "Arnott's"}
-        {"company_or_abn": "88000014675"}
-    """
     user_id:        Optional[str] = None
     barcode:        Optional[str] = None
     brand:          Optional[str] = None
@@ -174,7 +183,6 @@ class SearchRequest(BaseModel):
 
 
 class CreateUserRequest(BaseModel):
-    """Development endpoint payload (backward compatibility)."""
     email:     str
     user_type: str = "consumer"
 
@@ -184,7 +192,6 @@ class CreateUserRequest(BaseModel):
 # ============================================================
 
 def clean_text(value: Optional[str]) -> Optional[str]:
-    """Strip whitespace; normalise empty strings to None."""
     if value is None:
         return None
     value = value.strip()
@@ -196,15 +203,6 @@ def get_single_input_type(
     brand:          Optional[str],
     company_or_abn: Optional[str],
 ) -> Tuple[str, str, str]:
-    """
-    Enforce exactly one input per request.
-
-    Returns (input_type, input_value, frontend_type).
-    Raises HTTP 400 on zero inputs, multiple inputs, or format errors.
-
-    input_type values match search_query.input_type_enum:
-        barcode | brand_name | company_name
-    """
     provided = []
     if barcode:        provided.append(("barcode",      barcode,        "barcode"))
     if brand:          provided.append(("brand_name",   brand,          "brand"))
@@ -235,7 +233,7 @@ def get_single_input_type(
         raise HTTPException(status_code=400, detail="Brand name must be at least 2 characters.")
 
     if input_type == "company_name":
-        cleaned = clean_abn(input_value)   # from abn_pipeline
+        cleaned = clean_abn(input_value)
         if cleaned.isdigit() and not is_abn(cleaned):
             raise HTTPException(status_code=400, detail="Invalid ABN — must be exactly 11 digits.")
         if not cleaned.isdigit() and len(input_value.strip()) < 2:
@@ -249,7 +247,6 @@ def get_single_input_type(
 # ============================================================
 
 def create_search_query(cur, input_type: str, input_value: str, user_id: Optional[str] = None):
-    """Insert a pending search_query before running any external API calls."""
     cur.execute(
         """
         INSERT INTO search_query (user_id, input_type, input_value, resolution_status)
@@ -269,7 +266,6 @@ def update_search_query(
     resolved_brand_id:   Optional[str] = None,
     resolved_product_id: Optional[str] = None,
 ):
-    """Update search_query to 'resolved' or 'failed' after the pipeline completes."""
     if status not in ("resolved", "failed"):
         status = "failed"
     cur.execute(
@@ -295,7 +291,7 @@ def root():
         "message":       "EcoTrace backend is running",
         "main_endpoint": "POST /api/search",
         "consumer_flow": "query_id based, no login required",
-        "version":       "5.1.0",
+        "version":       "6.0.0",
     }
 
 
@@ -310,7 +306,6 @@ def health():
 
 @app.post("/api/users/test")
 def create_test_user(payload: CreateUserRequest):
-    """Create or reuse a test user (backward compatibility, login not required)."""
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -348,14 +343,9 @@ def search_entity(payload: SearchRequest):
     1. Validate exactly one input type.
     2. Insert a pending search_query record (obtains query_id).
     3. Dispatch to the appropriate pipeline module.
-    4. Update search_query to resolved / failed.
-    5. Return a unified JSON response.
-
-    Pipeline dispatch
-    -----------------
-    barcode       -> barcode_pipeline.run_barcode_phase()
-    brand_name    -> brand_pipeline.run_brand_phase()
-    company_name  -> abn_pipeline.run_company_abn_phase()  (auto-detects ABN vs name)
+    4. Persist pipeline results to DB (abn_record, company, trademark, brand, product).
+    5. Update search_query to resolved / failed with resolved entity IDs.
+    6. Return a unified JSON response.
     """
     barcode        = clean_text(payload.barcode)
     brand          = clean_text(payload.brand)
@@ -376,52 +366,61 @@ def search_entity(payload: SearchRequest):
         result:         Dict[str, Any] = {}
         db_status = "failed"
 
-        # ----------------------------------------------------
+        # resolved entity IDs — populated by each branch if DB write succeeds
+        resolved_company_id: Optional[str] = None
+        resolved_brand_id:   Optional[str] = None
+        resolved_product_id: Optional[str] = None
+
+        # --------------------------------------------------------
         # Branch 1 — Company name / ABN
-        # Auto-detects ABN vs name inside run_company_abn_phase.
-        # ABN path: format check -> checksum -> ABR SearchByABN
-        # Name path: validation -> ABR SearchByName
-        # ----------------------------------------------------
+        # Writes: abn_record, company
+        # --------------------------------------------------------
         if input_type == "company_name":
             phase = run_company_abn_phase(company_or_abn)
 
             pipeline_steps = phase.get("pipeline", [])
             db_status      = "resolved" if phase["success"] else "failed"
 
-            # Normalise result shape: both ABN and name paths expose `company`.
             company_block = phase.get("company") or {
-                "legal_name":  phase.get("legal_name"),
-                "abn":         phase.get("abn"),
-                "entity_type": phase.get("entity_type"),
-                "acn":         phase.get("acn"),
-                "state":       phase.get("state"),
-                "postcode":    phase.get("postcode"),
-                "abn_status":  phase.get("abn_status"),
-                "gst_registered": phase.get("gst_registered"),
-                "gst_from_date":  phase.get("gst_from_date"),
+                "legal_name":     phase.get("legal_name"),
+                "abn":            phase.get("abn"),
+                "entity_type":    phase.get("entity_type"),
+                "acn":            phase.get("acn"),
+                "state":          phase.get("state"),
+                "postcode":       phase.get("postcode"),
+                "abn_status":     phase.get("abn_status"),
+                "gst_registered": phase.get("gst_registered", False),
                 "main_activity":  phase.get("main_activity"),
             }
 
             result = {
-                "input_type":    "abn"          if phase.get("valid_format") is not None else "company_name",
-                "input_value":   input_value,
-                "status":        phase.get("status", "not_found"),
-                "source":        "ABR",
-                "company":       company_block,
-                "all_results":   phase.get("all_results", []),
-                "total_results": phase.get("total", 0),
+                "input_type":     "abn" if phase.get("valid_format") is not None else "company_name",
+                "input_value":    input_value,
+                "status":         phase.get("status", "not_found"),
+                "source":         "ABR",
+                "company":        company_block,
+                "all_results":    phase.get("all_results", []),
+                "total_results":  phase.get("total", 0),
                 "valid_checksum": phase.get("valid_checksum"),
-                "confidence":    phase.get("confidence", 0),
-                "errors":        phase.get("errors", []),
-                "message":       phase.get("error"),
+                "confidence":     phase.get("confidence", 0),
+                "errors":         phase.get("errors", []),
+                "message":        phase.get("error"),
             }
 
-            update_search_query(cur, query_id, db_status)
+            # --- DB write ---
+            if phase["success"] and company_block.get("abn"):
+                resolved_company_id = upsert_company(cur, company_block)
+                if resolved_company_id:
+                    pipeline_steps.append(
+                        f"DB: company upserted (company_id={resolved_company_id})"
+                    )
+                else:
+                    pipeline_steps.append("DB: company write failed (see server log)")
 
-        # ----------------------------------------------------
+        # --------------------------------------------------------
         # Branch 2 — Barcode
-        # EAN-13 checksum -> OpenFoodFacts -> GS1 fallback -> ABR
-        # ----------------------------------------------------
+        # Writes: abn_record, company, trademark, brand, product
+        # --------------------------------------------------------
         elif input_type == "barcode":
             phase = run_barcode_phase(
                 barcode,
@@ -446,12 +445,65 @@ def search_entity(payload: SearchRequest):
                 "message":          phase.get("error"),
             }
 
-            update_search_query(cur, query_id, db_status)
+            # --- DB write ---
+            if phase["success"]:
+                # 1. Company from ABR result
+                abr_data = extract_abr_data(phase.get("abr") or {})
+                if abr_data:
+                    resolved_company_id = upsert_company(cur, abr_data)
+                    if resolved_company_id:
+                        pipeline_steps.append(
+                            f"DB: company upserted (company_id={resolved_company_id})"
+                        )
 
-        # ----------------------------------------------------
+                # 2. Trademark
+                tm = phase.get("trademark") or {}
+                trademark_id: Optional[str] = None
+                if tm.get("number"):
+                    trademark_id = upsert_trademark(cur, tm)
+                    if trademark_id:
+                        pipeline_steps.append(
+                            f"DB: trademark upserted (trademark_id={trademark_id})"
+                        )
+
+                # 3. Brand
+                brand_name_for_db = (
+                    phase.get("brand_clean")
+                    or phase.get("brand_owner")
+                    or phase.get("brand_raw")
+                )
+                if resolved_company_id and brand_name_for_db:
+                    resolved_brand_id = upsert_brand(
+                        cur, brand_name_for_db, resolved_company_id, trademark_id
+                    )
+                    if resolved_brand_id:
+                        pipeline_steps.append(
+                            f"DB: brand upserted (brand_id={resolved_brand_id})"
+                        )
+
+                # 4. Product
+                product_block = phase.get("product") or {}
+                barcode_clean = phase.get("barcode") or barcode
+                if resolved_brand_id and barcode_clean:
+                    resolved_product_id = upsert_product(
+                        cur,
+                        {
+                            "barcode":           barcode_clean,
+                            "product_name":      product_block.get("product_name"),
+                            "manufacturer_name": phase.get("manufacturer"),
+                            "data_source":       "open_food_facts",
+                        },
+                        resolved_brand_id,
+                    )
+                    if resolved_product_id:
+                        pipeline_steps.append(
+                            f"DB: product upserted (product_id={resolved_product_id})"
+                        )
+
+        # --------------------------------------------------------
         # Branch 3 — Brand name
-        # IP Australia Trade Mark Search -> extract owner -> ABR
-        # ----------------------------------------------------
+        # Writes: abn_record, company, trademark, brand
+        # --------------------------------------------------------
         elif input_type == "brand_name":
             phase = run_brand_phase(
                 brand,
@@ -474,8 +526,59 @@ def search_entity(payload: SearchRequest):
                 "message":          phase.get("error"),
             }
 
-            update_search_query(cur, query_id, db_status)
+            # --- DB write ---
+            if phase["success"]:
+                # 1. Company — prefer full ABR result, fall back to owner_abn from TM record
+                abr_data = extract_abr_data(phase.get("abr") or {})
+                if abr_data:
+                    resolved_company_id = upsert_company(cur, abr_data)
+                elif phase.get("owner_abn"):
+                    resolved_company_id = upsert_company(cur, {
+                        "abn":            phase["owner_abn"],
+                        "legal_name":     phase.get("legal_owner") or "Unknown",
+                        "entity_type":    "OTHER",
+                        "gst_registered": False,
+                    })
 
+                if resolved_company_id:
+                    pipeline_steps.append(
+                        f"DB: company upserted (company_id={resolved_company_id})"
+                    )
+
+                # 2. Trademark
+                tm = phase.get("trademark") or {}
+                trademark_id = None
+                if tm.get("number"):
+                    trademark_id = upsert_trademark(
+                        cur,
+                        {**tm, "legal_owner": phase.get("legal_owner")},
+                    )
+                    if trademark_id:
+                        pipeline_steps.append(
+                            f"DB: trademark upserted (trademark_id={trademark_id})"
+                        )
+
+                # 3. Brand
+                if resolved_company_id:
+                    resolved_brand_id = upsert_brand(
+                        cur, brand, resolved_company_id, trademark_id
+                    )
+                    if resolved_brand_id:
+                        pipeline_steps.append(
+                            f"DB: brand upserted (brand_id={resolved_brand_id})"
+                        )
+
+        # --------------------------------------------------------
+        # Finalise: update search_query with resolved IDs
+        # --------------------------------------------------------
+        update_search_query(
+            cur,
+            query_id,
+            db_status,
+            resolved_company_id,
+            resolved_brand_id,
+            resolved_product_id,
+        )
         conn.commit()
 
         return {
@@ -484,8 +587,13 @@ def search_entity(payload: SearchRequest):
             "input_type":        frontend_type,
             "input_value":       input_value,
             "resolution_status": db_status,
-            "pipeline_steps":    pipeline_steps,
-            "result":            result,
+            "resolved_ids": {
+                "company_id": resolved_company_id,
+                "brand_id":   resolved_brand_id,
+                "product_id": resolved_product_id,
+            },
+            "pipeline_steps": pipeline_steps,
+            "result":         result,
         }
 
     except HTTPException:
@@ -505,31 +613,11 @@ def search_entity(payload: SearchRequest):
 
 @app.get("/api/debug/trademark-auth")
 def debug_trademark_auth():
-    """
-    Diagnose IP Australia OAuth configuration.
-
-    Tries both authentication methods and reports:
-    - Whether credentials are set in .env
-    - Which token URL is in use
-    - Which method succeeded (Basic Auth header vs body params)
-    - The HTTP status code returned by the token endpoint
-    - A human-readable error if both methods fail
-
-    Use this endpoint FIRST when the brand pipeline returns
-    'Unable to obtain IP Australia OAuth token'.
-
-    Example:
-        curl http://localhost:8000/api/debug/trademark-auth
-    """
     return diagnose_token()
 
 
 @app.get("/api/abn/verify/{abn}")
 def verify_abn_endpoint(abn: str):
-    """
-    Verify a single ABN (format + checksum + ABR).
-    Example: GET /api/abn/verify/88000014675
-    """
     from abn_pipeline import validate_abn_checksum, run_abn_phase
     cleaned = clean_abn(abn)
     if not is_abn(cleaned):
@@ -539,10 +627,6 @@ def verify_abn_endpoint(abn: str):
 
 @app.get("/api/company/search/{company_name}")
 def lookup_company_name(company_name: str):
-    """
-    Search a company name via ABR.
-    Example: GET /api/company/search/Coles
-    """
     from abn_pipeline import run_company_phase
     cleaned = clean_text(company_name)
     if not cleaned or len(cleaned) < 2:
@@ -552,16 +636,11 @@ def lookup_company_name(company_name: str):
 
 @app.get("/api/barcode/{barcode}")
 def lookup_barcode(barcode: str):
-    """
-    Run the full barcode pipeline (EAN-13 -> OpenFoodFacts -> GS1 -> ABR).
-    Example: GET /api/barcode/9310055002440
-    """
     return run_barcode_phase(barcode, abr_lookup_fn=search_company_name_with_abr)
 
 
 @app.get("/api/trademark/token-test")
 def test_ip_australia_token():
-    """Verify IP Australia OAuth credentials are configured correctly."""
     token = get_ip_australia_access_token()
     if not token:
         return {
@@ -574,10 +653,6 @@ def test_ip_australia_token():
 
 @app.get("/api/trademark/search/{brand}")
 def lookup_trademark(brand: str):
-    """
-    Run the full brand pipeline (IP Australia Trade Mark -> ABR).
-    Example: GET /api/trademark/search/TimTam
-    """
     cleaned = clean_text(brand)
     if not cleaned or len(cleaned) < 2:
         raise HTTPException(status_code=400, detail="Brand must be at least 2 characters")
@@ -590,7 +665,6 @@ def lookup_trademark(brand: str):
 
 @app.get("/api/search/history/{user_id}")
 def get_search_history(user_id: str):
-    """Return search history for a given user_id, newest first."""
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -615,7 +689,6 @@ def get_search_history(user_id: str):
 
 @app.get("/api/search/query/{query_id}")
 def get_search_query(query_id: str):
-    """Retrieve a single search_query record by query_id."""
     conn = get_conn()
     cur  = conn.cursor()
     try:
