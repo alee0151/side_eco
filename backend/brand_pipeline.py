@@ -65,7 +65,7 @@ import requests
 # ============================================================
 
 _DEFAULT_TOKEN_URL     = "https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token"
-_DEFAULT_TRADEMARK_URL = "https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1"
+_DEFAULT_TRADEMARK_URL = "https://test.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1"
 
 
 def _token_url() -> str:
