@@ -13,14 +13,13 @@ Brand pipeline flow
       ├─── 1. Validate     ─── minimum length, strip whitespace
       │
       ├─── 2. OAuth token  ─── IP Australia client_credentials flow (cached)
-      │                         Token endpoint  : IP_AUSTRALIA_TOKEN_URL
-      │                         Default         : test.api.ipaustralia.gov.au
+      │                         Token URL : IP_AUSTRALIA_TOKEN_URL  (default: test instance)
+      │                         Method    : Basic Auth header first, body params fallback
       │
       ├─── 3. TM Search    ─── POST /search/quick
-      │                         Trademark URL   : IP_AUSTRALIA_TRADEMARK_URL
-      │                         Default         : production.api.ipaustralia.gov.au
-      │                         filters: quickSearchType=WORD, status=REGISTERED
-      │                         returns {trademarkIds, count}
+      │                         TM URL   : IP_AUSTRALIA_TRADEMARK_URL (default: production)
+      │                         filters  : quickSearchType=WORD, status=REGISTERED
+      │                         returns  : {trademarkIds, count}
       │
       ├─── 4. TM Detail    ─── GET /trade-mark/{ipRightIdentifier}
       │                         walks IDs until one resolves
@@ -29,32 +28,41 @@ Brand pipeline flow
       │
       └─── 6. ABR verify   ─── ABR name search using extracted legal owner
 
-External APIs
--------------
-- IP Australia OAuth token  (TEST — IP_AUSTRALIA_TOKEN_URL)
-  POST https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token
+OAuth notes
+-----------
+IP Australia uses a MuleSoft gateway.  MuleSoft OAuth servers expect the
+client credentials in an HTTP Basic Authentication header:
 
-- IP Australia Trade Mark Quick Search  (PRODUCTION — IP_AUSTRALIA_TRADEMARK_URL)
-  POST https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/search/quick
-  Body: {"query": str, "filters": {"quickSearchType": ["WORD"], "status": ["REGISTERED"]}}
-  Response: {"trademarkIds": [...], "count": N, "aggregations": {...}}
+    Authorization: Basic base64(client_id:client_secret)
+    Content-Type: application/x-www-form-urlencoded
+    Body: grant_type=client_credentials
 
-- IP Australia Trade Mark Detail  (PRODUCTION — IP_AUSTRALIA_TRADEMARK_URL)
-  GET  https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trade-mark/{ipRightIdentifier}
-  Response: ApiTrademark — key fields:
-    number       : str
-    words        : str[]          ← the word-mark text(s)
-    statusCode   : str            ← e.g. "Registered"
-    statusGroup  : str            ← e.g. "REGISTERED"
-    owner        : ApiPartyType[] ← [{name, abn, acnOrArbn, jurisdiction, structuredAddress}]
-    goodsAndServices : ApiGoodsServices[]
+This implementation tries Basic Auth first and falls back to body params
+(RFC 6749 §2.3.1) if the server returns 401 or 400.
 
 Environment variables  (set in backend/.env)
 --------------------------------------------
   IP_AUSTRALIA_CLIENT_ID       your OAuth client id
   IP_AUSTRALIA_CLIENT_SECRET   your OAuth client secret
-  IP_AUSTRALIA_TOKEN_URL       OAuth token endpoint  (default: test instance)
-  IP_AUSTRALIA_TRADEMARK_URL   Trade Mark Search API (default: production instance)
+  IP_AUSTRALIA_TOKEN_URL       token endpoint  (default: test instance)
+  IP_AUSTRALIA_TRADEMARK_URL   TM Search API   (default: production instance)
+
+Test with the diagnostic endpoint before running a full search:
+    GET /api/debug/trademark-auth
+
+External APIs
+-------------
+- IP Australia OAuth token  (IP_AUSTRALIA_TOKEN_URL)
+  POST https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token
+
+- IP Australia Trade Mark Quick Search  (IP_AUSTRALIA_TRADEMARK_URL)
+  POST .../search/quick
+  Body: {"query": str, "filters": {"quickSearchType": ["WORD"], "status": ["REGISTERED"]}}
+  Response: {"trademarkIds": [...], "count": N}
+
+- IP Australia Trade Mark Detail  (IP_AUSTRALIA_TRADEMARK_URL)
+  GET .../trade-mark/{ipRightIdentifier}
+  Response: ApiTrademark (owner[], words[], statusCode, statusGroup, ...)
 
 Usage
 -----
@@ -62,6 +70,7 @@ Usage
     brand_result = run_brand_phase(brand_name, abr_lookup_fn=search_company_name_with_abr)
 """
 
+import base64
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -96,8 +105,8 @@ _TM_DETAIL_MAX_TRIES = 10
 # ---------------------------------------------------------------
 # Confirmed default URLs  (overridable via .env)
 #
-# TOKEN_URL    : TEST     instance  (confirmed)
-# TRADEMARK_URL: PRODUCTION instance (confirmed)
+# TOKEN_URL    : TEST       instance  (confirmed)
+# TRADEMARK_URL: PRODUCTION instance  (confirmed)
 # ---------------------------------------------------------------
 _DEFAULT_TOKEN_URL = "https://test.api.ipaustralia.gov.au/public/external-token-api/v1/access_token"
 _DEFAULT_TM_URL    = "https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1"
@@ -108,12 +117,12 @@ _DEFAULT_TM_URL    = "https://production.api.ipaustralia.gov.au/public/australia
 # ============================================================
 
 def _token_url() -> str:
-    """OAuth token endpoint — reads IP_AUSTRALIA_TOKEN_URL from env, falls back to TEST default."""
+    """OAuth token endpoint — reads IP_AUSTRALIA_TOKEN_URL from env."""
     return (os.getenv("IP_AUSTRALIA_TOKEN_URL") or _DEFAULT_TOKEN_URL).strip()
 
 
 def _base_url() -> str:
-    """Trade Mark Search API base — reads IP_AUSTRALIA_TRADEMARK_URL from env, falls back to PRODUCTION default."""
+    """Trade Mark Search API base — reads IP_AUSTRALIA_TRADEMARK_URL from env."""
     return (os.getenv("IP_AUSTRALIA_TRADEMARK_URL") or _DEFAULT_TM_URL).rstrip("/")
 
 
@@ -121,11 +130,73 @@ def _base_url() -> str:
 # Section 2 — OAuth Token Management
 # ============================================================
 
+def _make_token_request(client_id: str, client_secret: str) -> Optional[requests.Response]:
+    """
+    Attempt to obtain an OAuth token using two methods:
+
+    Method A (preferred) — HTTP Basic Auth header:
+        Authorization: Basic base64(client_id:client_secret)
+        Body: grant_type=client_credentials
+
+    Method B (fallback) — credentials in request body (RFC 6749 §2.3.1):
+        Body: grant_type=client_credentials&client_id=...&client_secret=...
+
+    MuleSoft-based gateways (IP Australia) typically require Method A.
+    Returns the first successful Response, or None if both fail.
+    """
+    url = _token_url()
+    basic_creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+
+    # --- Method A: Basic Auth header ---
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Content-Type":  "application/x-www-form-urlencoded",
+                "Accept":        "application/json",
+                "Authorization": f"Basic {basic_creds}",
+            },
+            data={"grant_type": "client_credentials"},
+            timeout=20,
+        )
+        print(f"[brand_pipeline] Token (Basic Auth): HTTP {resp.status_code}")
+        if resp.status_code not in (400, 401, 403):
+            return resp
+        print(f"[brand_pipeline] Basic Auth rejected ({resp.status_code}), trying body params...")
+    except requests.exceptions.Timeout:
+        print("[brand_pipeline] Token request (Basic Auth) timed out")
+    except requests.exceptions.RequestException as e:
+        print(f"[brand_pipeline] Token request (Basic Auth) error: {e}")
+
+    # --- Method B: credentials in body ---
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept":       "application/json",
+            },
+            data={
+                "grant_type":    "client_credentials",
+                "client_id":     client_id,
+                "client_secret": client_secret,
+            },
+            timeout=20,
+        )
+        print(f"[brand_pipeline] Token (body params): HTTP {resp.status_code}")
+        return resp
+    except requests.exceptions.Timeout:
+        print("[brand_pipeline] Token request (body params) timed out")
+    except requests.exceptions.RequestException as e:
+        print(f"[brand_pipeline] Token request (body params) error: {e}")
+
+    return None
+
+
 def get_ip_australia_access_token() -> Optional[str]:
     """
-    Obtain a cached OAuth 2.0 access token from IP Australia.
-    Token is cached in-process and reused until 60 seconds before expiry.
-    Reads token URL from IP_AUSTRALIA_TOKEN_URL env var (default: test instance).
+    Obtain (or return cached) IP Australia OAuth token.
+    Cached in-process and reused until 60 s before expiry.
     """
     now = int(time.time())
     if _TOKEN_CACHE["access_token"] and now < int(_TOKEN_CACHE["expires_at"]) - 60:
@@ -134,50 +205,48 @@ def get_ip_australia_access_token() -> Optional[str]:
     client_id     = (os.getenv("IP_AUSTRALIA_CLIENT_ID")     or "").strip()
     client_secret = (os.getenv("IP_AUSTRALIA_CLIENT_SECRET") or "").strip()
 
+    # ---- Guard: credentials not configured at all ----
     if not client_id or not client_secret:
-        print("[brand_pipeline] IP Australia credentials missing in .env")
-        return None
-
-    url = _token_url()
-    print(f"[brand_pipeline] Fetching OAuth token from: {url}")
-
-    try:
-        response = requests.post(
-            url,
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
-            data={
-                "grant_type":    "client_credentials",
-                "client_id":     client_id,
-                "client_secret": client_secret,
-            },
-            timeout=20,
+        print(
+            "[brand_pipeline] ERROR: IP_AUSTRALIA_CLIENT_ID or IP_AUSTRALIA_CLIENT_SECRET "
+            "is missing from .env.  Copy backend/.env.example to backend/.env and fill in "
+            "your credentials."
         )
-        if not response.ok:
-            print(f"[brand_pipeline] Token request failed: HTTP {response.status_code} — {response.text[:200]}")
-            return None
-
-        token_data   = response.json()
-        access_token = token_data.get("access_token")
-        expires_in   = int(token_data.get("expires_in", 3600))
-
-        if not access_token:
-            print("[brand_pipeline] Token response contained no access_token")
-            return None
-
-        _TOKEN_CACHE["access_token"] = access_token
-        _TOKEN_CACHE["expires_at"]   = now + expires_in
-        return access_token
-
-    except requests.exceptions.Timeout:
-        print("[brand_pipeline] Token request timed out")
         return None
-    except Exception as e:
-        print(f"[brand_pipeline] Token request exception: {e!r}")
+
+    print(f"[brand_pipeline] Fetching OAuth token from: {_token_url()}")
+    resp = _make_token_request(client_id, client_secret)
+
+    if resp is None:
+        print("[brand_pipeline] All token request attempts failed (network / timeout).")
         return None
+
+    if not resp.ok:
+        print(
+            f"[brand_pipeline] Token endpoint returned HTTP {resp.status_code}.\n"
+            f"  URL   : {_token_url()}\n"
+            f"  Body  : {resp.text[:300]}\n"
+            "  Check that IP_AUSTRALIA_CLIENT_ID and IP_AUSTRALIA_CLIENT_SECRET "
+            "are correct and that your app subscription is active on the portal."
+        )
+        return None
+
+    token_data   = resp.json()
+    access_token = token_data.get("access_token")
+    expires_in   = int(token_data.get("expires_in", 3600))
+
+    if not access_token:
+        print(f"[brand_pipeline] Token response had no access_token field: {token_data}")
+        return None
+
+    _TOKEN_CACHE["access_token"] = access_token
+    _TOKEN_CACHE["expires_at"]   = now + expires_in
+    print(f"[brand_pipeline] Token obtained, expires in {expires_in}s.")
+    return access_token
 
 
 def _get_auth_headers() -> Optional[Dict[str, str]]:
-    """Build authorisation headers, refreshing the token if needed."""
+    """Build Bearer authorisation headers, refreshing the token if needed."""
     token = get_ip_australia_access_token()
     if not token:
         return None
@@ -203,8 +272,12 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
     if not headers:
         return {
             "success": False,
-            "message": "Unable to obtain IP Australia OAuth token. "
-                       "Check IP_AUSTRALIA_CLIENT_ID and IP_AUSTRALIA_CLIENT_SECRET in .env.",
+            "message": (
+                "Unable to obtain IP Australia OAuth token. "
+                "Check that backend/.env exists with valid "
+                "IP_AUSTRALIA_CLIENT_ID and IP_AUSTRALIA_CLIENT_SECRET. "
+                f"Token URL in use: {_token_url()}"
+            ),
         }
 
     url  = f"{_base_url()}/search/quick"
@@ -222,7 +295,7 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
         resp = requests.post(url, headers=headers, json=body, timeout=20)
 
         if resp.status_code == 401:
-            # Token may have expired mid-request — clear cache and retry once
+            # Token may have expired mid-request — clear and retry once
             _TOKEN_CACHE["access_token"] = None
             _TOKEN_CACHE["expires_at"]   = 0
             headers = _get_auth_headers()
@@ -248,7 +321,7 @@ def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
     """
     GET {IP_AUSTRALIA_TRADEMARK_URL}/trade-mark/{ipRightIdentifier}
     Returns full ApiTrademark record.
-    404 is surfaced as not_found=True so the caller can try the next ID.
+    404 surfaced as not_found=True so caller can try the next ID.
     """
     headers = _get_auth_headers()
     if not headers:
@@ -310,7 +383,6 @@ def _fetch_first_available_trademark(
             skipped.append(tm_id)
             continue
 
-        # Non-404 error — stop immediately
         return {
             "success": False,
             "message": resp.get("message", "Trademark detail lookup failed"),
@@ -342,7 +414,6 @@ def _extract_owner_from_record(record: Dict[str, Any]) -> Optional[str]:
     if not isinstance(record, dict):
         return None
 
-    # PRIMARY: owner[] — canonical field per ApiTrademark schema
     owner_list = record.get("owner")
     if isinstance(owner_list, list) and owner_list:
         first = owner_list[0]
@@ -370,17 +441,16 @@ def _build_trademark_summary(record: Dict[str, Any], legal_owner: Optional[str])
     Flatten an ApiTrademark record into the shape the pipeline expects.
 
     Field mapping (per api.json ApiTrademark schema):
-      words[]              → word_mark  (str[] joined)
-      statusCode           → status     (e.g. "Registered")
-      statusGroup          → status     (fallback, e.g. "REGISTERED")
+      words[]               → word_mark  (str[] joined)
+      statusCode            → status     (e.g. "Registered")
+      statusGroup           → status     (fallback, e.g. "REGISTERED")
       filingDate /
-        lodgementDate      → filing_date
-      enteredOnRegisterDate→ registration_date
-      goodsAndServices     → goods_services
+        lodgementDate       → filing_date
+      enteredOnRegisterDate → registration_date
+      goodsAndServices      → goods_services
     """
     words = record.get("words") or []
     word_mark = " ".join(words).strip() if isinstance(words, list) else None
-
     status = record.get("statusCode") or record.get("statusGroup")
 
     return {
@@ -395,7 +465,86 @@ def _build_trademark_summary(record: Dict[str, Any], legal_owner: Optional[str])
 
 
 # ============================================================
-# Section 6 — Orchestrated Brand Resolution
+# Section 6 — Diagnostic helper (used by /api/debug/trademark-auth)
+# ============================================================
+
+def diagnose_token() -> Dict[str, Any]:
+    """
+    Test the OAuth token fetch in isolation and return a structured report.
+    Called by GET /api/debug/trademark-auth in main.py.
+    """
+    client_id     = (os.getenv("IP_AUSTRALIA_CLIENT_ID")     or "").strip()
+    client_secret = (os.getenv("IP_AUSTRALIA_CLIENT_SECRET") or "").strip()
+    token_url_val = _token_url()
+    tm_url_val    = _base_url()
+
+    report: Dict[str, Any] = {
+        "token_url":          token_url_val,
+        "trademark_url":      tm_url_val,
+        "client_id_set":      bool(client_id),
+        "client_secret_set":  bool(client_secret),
+        "token_obtained":     False,
+        "method_used":        None,
+        "http_status":        None,
+        "error":              None,
+    }
+
+    if not client_id or not client_secret:
+        report["error"] = (
+            "IP_AUSTRALIA_CLIENT_ID or IP_AUSTRALIA_CLIENT_SECRET is missing from .env. "
+            "Copy backend/.env.example to backend/.env and fill in your credentials."
+        )
+        return report
+
+    basic_creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+
+    # Try Method A: Basic Auth
+    try:
+        resp = requests.post(
+            token_url_val,
+            headers={
+                "Content-Type":  "application/x-www-form-urlencoded",
+                "Accept":        "application/json",
+                "Authorization": f"Basic {basic_creds}",
+            },
+            data={"grant_type": "client_credentials"},
+            timeout=20,
+        )
+        report["http_status"] = resp.status_code
+        if resp.ok and resp.json().get("access_token"):
+            report["token_obtained"] = True
+            report["method_used"]    = "Basic Auth header"
+            return report
+        report["error"] = f"Basic Auth: HTTP {resp.status_code} — {resp.text[:200]}"
+    except Exception as e:
+        report["error"] = f"Basic Auth exception: {e}"
+
+    # Try Method B: body params
+    try:
+        resp = requests.post(
+            token_url_val,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+            timeout=20,
+        )
+        report["http_status"] = resp.status_code
+        if resp.ok and resp.json().get("access_token"):
+            report["token_obtained"] = True
+            report["method_used"]    = "Body params"
+            report["error"]          = None
+            return report
+        report["error"] = (
+            report.get("error", "") +
+            f" | Body params: HTTP {resp.status_code} — {resp.text[:200]}"
+        )
+    except Exception as e:
+        report["error"] = (report.get("error", "") or "") + f" | Body params exception: {e}"
+
+    return report
+
+
+# ============================================================
+# Section 7 — Orchestrated Brand Resolution
 # ============================================================
 
 def resolve_brand(
@@ -409,9 +558,6 @@ def resolve_brand(
     3. Walk IDs — GET {TRADEMARK_URL}/trade-mark/{id} until one resolves.
     4. Extract legal owner from record.owner[] (ApiPartyType[]).
     5. ABR name lookup on extracted owner (if abr_lookup_fn provided).
-
-    Token obtained from IP_AUSTRALIA_TOKEN_URL (test instance by default).
-    Search/detail from IP_AUSTRALIA_TRADEMARK_URL (production instance by default).
     """
     pipeline: List[str] = []
     errors:   List[str] = []
@@ -545,7 +691,7 @@ def _strip_legal_suffix(name: str) -> str:
 
 
 # ============================================================
-# Section 7 — Convenience wrapper for main.py
+# Section 8 — Convenience wrapper for main.py
 # ============================================================
 
 def run_brand_phase(
