@@ -18,9 +18,10 @@ Brand pipeline flow
       │                         filters: quickSearchType=WORD, status=REGISTERED
       │                         returns {trademarkIds, count}
       │
-      ├─── 4. TM Detail    ─── GET /trademarks/{id} — walks IDs until one resolves
+      ├─── 4. TM Detail    ─── GET /trade-mark/{ipRightIdentifier}
+      │                         walks IDs until one resolves
       │
-      ├─── 5. Owner pick   ─── extract applicant / owner name from detail record
+      ├─── 5. Owner pick   ─── extract from record.owner[] (ApiPartyType[])
       │
       └─── 6. ABR verify   ─── ABR name search using extracted legal owner
 
@@ -30,12 +31,19 @@ External APIs
   POST https://api.ipaustralia.gov.au/public/external-token-api/v1/access_token
 
 - IP Australia Trade Mark Quick Search (PRODUCTION)
-  POST https://api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/search/quick
+  POST https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/search/quick
   Body: {"query": str, "filters": {"quickSearchType": ["WORD"], "status": ["REGISTERED"]}}
   Response: {"trademarkIds": [...], "count": N, "aggregations": {...}}
 
 - IP Australia Trade Mark Detail (PRODUCTION)
-  GET  https://api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trademarks/{id}
+  GET  https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trade-mark/{ipRightIdentifier}
+  Response: ApiTrademark — key fields:
+    number       : str
+    words        : str[]          ← the word-mark text(s)
+    statusCode   : str            ← e.g. "Registered"
+    statusGroup  : str            ← e.g. "REGISTERED"
+    owner        : ApiPartyType[] ← [{name, abn, acnOrArbn, jurisdiction, structuredAddress}]
+    goodsAndServices : ApiGoodsServices[]
 
 Usage
 -----
@@ -76,7 +84,7 @@ _TM_DETAIL_MAX_TRIES = 10
 
 # Production base URLs — overridable via .env
 _DEFAULT_TOKEN_URL = "https://api.ipaustralia.gov.au/public/external-token-api/v1/access_token"
-_DEFAULT_TM_URL    = "https://api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1"
+_DEFAULT_TM_URL    = "https://production.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1"
 
 
 # ============================================================
@@ -159,6 +167,7 @@ def _base_url() -> str:
 def _quick_search(brand_name: str) -> Dict[str, Any]:
     """
     POST /search/quick with WORD + REGISTERED filters.
+    Returns {"trademarkIds": [...], "count": N}
     """
     headers = _get_auth_headers()
     if not headers:
@@ -204,14 +213,21 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
 
 def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
     """
-    GET /trademarks/{id} → full trademark record.
+    GET /trade-mark/{ipRightIdentifier} → full ApiTrademark record.
+
+    Correct path per the official Swagger spec (api.json):
+        /trade-mark/{ipRightIdentifier}   ← hyphenated, singular
+    NOT:
+        /trademarks/{id}                  ← this was the previous (wrong) path
+
     404 is surfaced as not_found=True so the caller can try the next ID.
     """
     headers = _get_auth_headers()
     if not headers:
         return {"success": False, "message": "No auth token for trademark detail lookup"}
 
-    url = f"{_base_url()}/trademarks/{trademark_id}"
+    # FIX: path is /trade-mark/{id}, not /trademarks/{id}
+    url = f"{_base_url()}/trade-mark/{trademark_id}"
     try:
         resp = requests.get(url, headers=headers, timeout=20)
 
@@ -291,57 +307,68 @@ def _fetch_first_available_trademark(
 # ============================================================
 
 def _extract_owner_from_record(record: Dict[str, Any]) -> Optional[str]:
-    """Extract the legal owner / applicant name from a trademark detail record."""
-    def first_name_from_list(lst: Any) -> Optional[str]:
-        if not isinstance(lst, list) or not lst:
-            return None
-        item = lst[0]
-        if isinstance(item, str):
-            return item.strip() or None
-        if isinstance(item, dict):
-            return (
-                item.get("name")
-                or item.get("fullName")
-                or item.get("organisationName")
-                or item.get("legalName")
-                or None
-            )
-        return None
+    """
+    Extract the legal owner name from an ApiTrademark detail record.
 
+    Per the official Swagger spec (api.json), the correct field is:
+        record["owner"]  →  ApiPartyType[]
+                            each item: {name, abn, acnOrArbn, jurisdiction, structuredAddress}
+
+    The previous implementation checked non-existent keys like "applicants",
+    "holders", "proprietors" which are not in the API response schema.
+    """
     if not isinstance(record, dict):
         return None
 
-    for list_key in ("applicants", "owners", "holders", "proprietors"):
-        name = first_name_from_list(record.get(list_key))
-        if name:
-            return name.strip()
-
-    for obj_key in ("applicant", "owner", "holder", "proprietor"):
-        obj = record.get(obj_key)
-        if isinstance(obj, dict):
-            name = obj.get("name") or obj.get("fullName") or obj.get("organisationName")
-            if name:
+    # PRIMARY: owner[] — the canonical field per ApiTrademark schema
+    owner_list = record.get("owner")
+    if isinstance(owner_list, list) and owner_list:
+        first = owner_list[0]
+        if isinstance(first, dict):
+            name = first.get("name")
+            if isinstance(name, str) and name.strip():
                 return name.strip()
-        elif isinstance(obj, str) and obj.strip():
-            return obj.strip()
+        elif isinstance(first, str) and first.strip():
+            return first.strip()
 
-    for flat_key in ("ownerName", "applicantName", "holderName", "proprietorName"):
-        val = record.get(flat_key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+    # FALLBACK: addressForService[] carries the same ApiPartyType shape
+    afs_list = record.get("addressForService")
+    if isinstance(afs_list, list) and afs_list:
+        first = afs_list[0]
+        if isinstance(first, dict):
+            name = first.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
 
     return None
 
 
 def _build_trademark_summary(record: Dict[str, Any], legal_owner: Optional[str]) -> Dict:
-    """Flatten a trademark detail record into the shape the rest of the pipeline expects."""
+    """
+    Flatten an ApiTrademark detail record into the shape the rest of the
+    pipeline expects.
+
+    Correct field names per api.json ApiTrademark schema:
+      number       → record["number"]
+      words        → record["words"]        (str[] — the word-mark text)
+      statusCode   → record["statusCode"]   (e.g. "Registered")
+      statusGroup  → record["statusGroup"]  (e.g. "REGISTERED")
+      goodsAndServices → record["goodsAndServices"]
+    """
+    # words[] is the actual word-mark; join multiple elements if present
+    words = record.get("words") or []
+    word_mark = " ".join(words).strip() if isinstance(words, list) else None
+
+    # statusCode is human-readable ("Registered"); statusGroup is the enum ("REGISTERED")
+    status = record.get("statusCode") or record.get("statusGroup")
+
     return {
-        "number":            record.get("number")           or record.get("applicationNumber") or record.get("tmNumber"),
-        "word_mark":         record.get("wordMark")         or record.get("tradeMarkText")     or record.get("mark"),
-        "status":            record.get("status")           or record.get("tradeMarkStatus")   or record.get("tmStatus"),
-        "filing_date":       record.get("filingDate")       or record.get("applicationDate"),
-        "registration_date": record.get("registrationDate"),
-        "goods_services":    record.get("goodsAndServices") or record.get("niceClasses"),
+        "number":            record.get("number"),
+        "word_mark":         word_mark or None,
+        "status":            status,
+        "filing_date":       record.get("filingDate")       or record.get("lodgementDate"),
+        "registration_date": record.get("enteredOnRegisterDate"),
+        "goods_services":    record.get("goodsAndServices"),
         "legal_owner":       legal_owner,
     }
 
@@ -359,7 +386,7 @@ def resolve_brand(
     1. Validate brand_name (minimum 2 characters).
     2. POST /search/quick (WORD + REGISTERED) → get trademarkIds list.
     3. Walk IDs until one detail record resolves (skipping 404s).
-    4. Extract legal owner from detail record.
+    4. Extract legal owner from record.owner[] (ApiPartyType[]).
     5. ABR name lookup on extracted owner (if abr_lookup_fn provided).
     """
     pipeline: List[str] = []
@@ -451,11 +478,11 @@ def resolve_brand(
                 abr_result = abr_lookup_fn(short_name)
 
     confidence = 0
-    if resolved_id:                                                      confidence += 20
-    if str(trademark.get("status") or "").lower() == "registered":       confidence += 30
-    elif trademark.get("status"):                                        confidence += 10
-    if legal_owner:                                                      confidence += 20
-    if abr_result and abr_result.get("success"):                         confidence += 30
+    if resolved_id:                                                               confidence += 20
+    if str(trademark.get("status") or "").lower() == "registered":               confidence += 30
+    elif trademark.get("status"):                                                 confidence += 10
+    if legal_owner:                                                               confidence += 20
+    if abr_result and abr_result.get("success"):                                  confidence += 30
 
     return {
         "success":     True,
