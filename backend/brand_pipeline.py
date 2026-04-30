@@ -18,8 +18,8 @@ Brand pipeline flow
       │                         filters: quickSearchType=WORD, status=REGISTERED
       │                         returns {trademarkIds, count}
       │
-      ├─── 4. TM Detail    ─── GET /trademarks/{id} for the first (best) ID
-      │                         returns full record: owner, status, wordMark, etc.
+      ├─── 4. TM Detail    ─── GET /trademarks/{id} — walks IDs until one resolves
+      │                         (test env only has a subset of records)
       │
       ├─── 5. Owner pick   ─── extract applicant / owner name from detail record
       │
@@ -37,6 +37,7 @@ External APIs
 
 - IP Australia Trade Mark Detail (returns full record)
   GET  https://test.api.ipaustralia.gov.au/public/australian-trade-mark-search-api/v1/trademarks/{id}
+  NOTE: test env only contains a subset of records; 404 means try next ID.
 
 Usage
 -----
@@ -71,6 +72,11 @@ _TM_STATUS_RANK: Dict[str, int] = {
     "withdrawn":   8,
     "abandoned":   9,
 }
+
+# Maximum number of IDs to try before giving up on the detail lookup.
+# The test environment has a sparse record set so we may need to skip
+# several 404s before landing on a record that actually exists.
+_TM_DETAIL_MAX_TRIES = 10
 
 
 # ============================================================
@@ -165,14 +171,8 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
     POST /search/quick with WORD + REGISTERED filters.
 
     Filters applied:
-      quickSearchType: ["WORD"]       — exact word-mark match only (excludes NAME matches)
+      quickSearchType: ["WORD"]       — exact word-mark match only
       status:          ["REGISTERED"] — only live, registered trademarks
-
-    Without filters, a query like 'arnott' returns 799 IDs (789 NAME + REMOVED).
-    With these two filters the result set shrinks to the handful of active word marks.
-
-    Returns the raw response dict. The caller fetches a detail record for
-    whichever ID it wants to use.
     """
     headers = _get_auth_headers()
     if not headers:
@@ -195,7 +195,6 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
         resp = requests.post(url, headers=headers, json=body, timeout=20)
 
         if resp.status_code == 401:
-            # Token expired mid-flight — clear cache and retry once.
             _TOKEN_CACHE["access_token"] = None
             _TOKEN_CACHE["expires_at"]   = 0
             headers = _get_auth_headers()
@@ -220,9 +219,8 @@ def _quick_search(brand_name: str) -> Dict[str, Any]:
 def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
     """
     GET /trademarks/{id} → full trademark record.
-
-    Returns the full record dict (wordMark, status, applicants, etc.)
-    or an error dict on failure.
+    Returns the full record dict or an error dict on failure.
+    404 is surfaced as success=False so callers can try the next ID.
     """
     headers = _get_auth_headers()
     if not headers:
@@ -240,10 +238,12 @@ def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
                 resp = requests.get(url, headers=headers, timeout=20)
 
         if resp.status_code == 404:
-            return {"success": False, "message": f"Trademark {trademark_id} not found"}
+            return {"success": False, "not_found": True,
+                    "message": f"Trademark {trademark_id} not found (404)"}
 
         if not resp.ok:
-            return {"success": False, "status_code": resp.status_code, "message": resp.text[:300]}
+            return {"success": False, "status_code": resp.status_code,
+                    "message": resp.text[:300]}
 
         return {"success": True, "data": resp.json()}
 
@@ -253,17 +253,59 @@ def _fetch_trademark_detail(trademark_id: str) -> Dict[str, Any]:
         return {"success": False, "message": f"Trademark detail network error: {e}"}
 
 
-def _pick_best_trademark_id(search_data: Dict[str, Any]) -> Optional[str]:
+def _fetch_first_available_trademark(
+    ids: List[str],
+    max_tries: int = _TM_DETAIL_MAX_TRIES,
+) -> Dict[str, Any]:
     """
-    Return the first trademark ID from a quick-search response.
+    Walk *ids* in relevance order and return the first detail record that
+    resolves successfully (HTTP 200).
 
-    Because the request already filters to REGISTERED + WORD marks,
-    the first ID is the highest-relevance registered word-mark result.
+    The test environment (test.api.ipaustralia.gov.au) only mirrors a
+    subset of live trademark records.  Requesting an ID that isn’t in the
+    test dataset returns {"message": "Resource not found"} (HTTP 404).
+    Rather than failing immediately, this helper skips 404s and keeps
+    trying until it either finds a record or exhausts *max_tries*.
+
+    Returns:
+        {"success": True,  "data": <record>, "tried": <n>, "id": <str>}
+        {"success": False, "message": <str>,  "tried": <n>}
     """
-    ids = search_data.get("trademarkIds") or []
-    if not ids:
-        return None
-    return str(ids[0])
+    skipped: List[str] = []
+
+    for tm_id in [str(i) for i in ids[:max_tries]]:
+        resp = _fetch_trademark_detail(tm_id)
+
+        if resp.get("success"):
+            if skipped:
+                print(f"[brand_pipeline] skipped 404 IDs {skipped}; resolved on {tm_id}")
+            return {
+                "success": True,
+                "data":    resp["data"],
+                "tried":   len(skipped) + 1,
+                "id":      tm_id,
+            }
+
+        # Only skip on 404; any other error (timeout, 5xx) is terminal.
+        if resp.get("not_found"):
+            skipped.append(tm_id)
+            continue
+
+        # Non-404 error — stop immediately
+        return {
+            "success": False,
+            "message": resp.get("message", "Trademark detail lookup failed"),
+            "tried":   len(skipped) + 1,
+        }
+
+    return {
+        "success": False,
+        "message": (
+            f"None of the first {max_tries} trademark IDs returned a valid record "
+            f"(all 404 in the test environment). IDs tried: {skipped}"
+        ),
+        "tried": len(skipped),
+    }
 
 
 # ============================================================
@@ -273,10 +315,7 @@ def _pick_best_trademark_id(search_data: Dict[str, Any]) -> Optional[str]:
 def _extract_owner_from_record(record: Dict[str, Any]) -> Optional[str]:
     """
     Extract the legal owner / applicant name from a trademark detail record.
-
-    IP Australia nests owner names in several possible fields.
-    Checks in priority order:
-      applicants[0] > owners[0] > holders[0] > singular forms > flat strings.
+    Priority: applicants > owners > holders > proprietors > singular forms > flat keys.
     """
     def first_name_from_list(lst: Any) -> Optional[str]:
         if not isinstance(lst, list) or not lst:
@@ -322,13 +361,13 @@ def _extract_owner_from_record(record: Dict[str, Any]) -> Optional[str]:
 def _build_trademark_summary(record: Dict[str, Any], legal_owner: Optional[str]) -> Dict:
     """Flatten a trademark detail record into the shape the rest of the pipeline expects."""
     return {
-        "number":             record.get("number")           or record.get("applicationNumber") or record.get("tmNumber"),
-        "word_mark":          record.get("wordMark")         or record.get("tradeMarkText")     or record.get("mark"),
-        "status":             record.get("status")           or record.get("tradeMarkStatus")   or record.get("tmStatus"),
-        "filing_date":        record.get("filingDate")       or record.get("applicationDate"),
-        "registration_date":  record.get("registrationDate"),
-        "goods_services":     record.get("goodsAndServices") or record.get("niceClasses"),
-        "legal_owner":        legal_owner,
+        "number":            record.get("number")           or record.get("applicationNumber") or record.get("tmNumber"),
+        "word_mark":         record.get("wordMark")         or record.get("tradeMarkText")     or record.get("mark"),
+        "status":            record.get("status")           or record.get("tradeMarkStatus")   or record.get("tmStatus"),
+        "filing_date":       record.get("filingDate")       or record.get("applicationDate"),
+        "registration_date": record.get("registrationDate"),
+        "goods_services":    record.get("goodsAndServices") or record.get("niceClasses"),
+        "legal_owner":       legal_owner,
     }
 
 
@@ -347,10 +386,9 @@ def resolve_brand(
     -----
     1. Validate brand_name (minimum 2 characters).
     2. POST /search/quick (WORD + REGISTERED) → get trademarkIds list.
-    3. Pick first (most relevant) trademark ID.
-    4. GET /trademarks/{id} → full trademark detail record.
-    5. Extract legal owner from detail record.
-    6. ABR name lookup on extracted owner (if abr_lookup_fn provided).
+    3. Walk IDs until one detail record resolves (skipping 404s).
+    4. Extract legal owner from detail record.
+    5. ABR name lookup on extracted owner (if abr_lookup_fn provided).
     """
     pipeline: List[str] = []
     errors:   List[str] = []
@@ -369,7 +407,7 @@ def resolve_brand(
             "confidence": 0,
         }
 
-    # Step 2 — Quick search (WORD + REGISTERED, IDs only)
+    # Step 2 — Quick search
     pipeline.append(f"IP Australia quick search (WORD+REGISTERED): '{brand_name}'")
     search_resp = _quick_search(brand_name)
 
@@ -389,12 +427,9 @@ def resolve_brand(
 
     search_data = search_resp["data"]
     total_ids   = search_data.get("count", 0)
+    ids         = search_data.get("trademarkIds") or []
 
-    # Step 3 — Pick best ID
-    pipeline.append(f"Select best trademark ID from {total_ids} filtered results")
-    best_id = _pick_best_trademark_id(search_data)
-
-    if not best_id:
+    if not ids:
         return {
             "success":     False,
             "brand_name":  brand_name,
@@ -407,18 +442,18 @@ def resolve_brand(
             "confidence":  0,
         }
 
-    # Step 4 — Fetch full detail record
-    pipeline.append(f"Fetch trademark detail: ID {best_id}")
-    detail_resp = _fetch_trademark_detail(best_id)
+    # Step 3 — Walk IDs until one detail record resolves
+    pipeline.append(f"Fetch trademark detail (up to {_TM_DETAIL_MAX_TRIES} tries) from {total_ids} results")
+    detail_resp = _fetch_first_available_trademark(ids)
 
     if not detail_resp.get("success"):
-        msg = detail_resp.get("message", f"Could not fetch trademark {best_id}")
+        msg = detail_resp.get("message", "Could not fetch any trademark detail record")
         errors.append(msg)
         return {
             "success":     False,
             "brand_name":  brand_name,
             "error":       msg,
-            "trademark":   {"number": best_id, "word_mark": None, "status": None, "legal_owner": None},
+            "trademark":   None,
             "legal_owner": None,
             "abr":         None,
             "tm_total":    total_ids,
@@ -427,11 +462,14 @@ def resolve_brand(
             "confidence":  10,
         }
 
+    resolved_id = detail_resp["id"]
+    pipeline.append(f"Resolved trademark ID: {resolved_id} (after {detail_resp['tried']} attempt(s))")
+
     record      = detail_resp["data"]
     legal_owner = _extract_owner_from_record(record)
     trademark   = _build_trademark_summary(record, legal_owner)
 
-    # Step 5 — ABR lookup (optional)
+    # Step 4 — ABR lookup (optional)
     abr_result: Optional[Dict[str, Any]] = None
 
     if abr_lookup_fn and legal_owner:
@@ -446,7 +484,7 @@ def resolve_brand(
 
     # Confidence scoring
     confidence = 0
-    if best_id:                                                          confidence += 20
+    if resolved_id:                                                      confidence += 20
     if str(trademark.get("status") or "").lower() == "registered":       confidence += 30
     elif trademark.get("status"):                                        confidence += 10
     if legal_owner:                                                      confidence += 20
@@ -493,10 +531,7 @@ def run_brand_phase(
     brand_name:    str,
     abr_lookup_fn: Any = None,
 ) -> Dict[str, Any]:
-    """
-    Thin wrapper used by /api/search brand branch in main.py.
-    Calls resolve_brand and adds a frontend-friendly `status` field.
-    """
+    """Thin wrapper used by /api/search brand branch in main.py."""
     resolved = resolve_brand(brand_name, abr_lookup_fn=abr_lookup_fn)
     resolved["status"] = "external_resolved" if resolved["success"] else "not_found"
     return resolved

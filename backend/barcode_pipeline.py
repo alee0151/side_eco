@@ -26,22 +26,13 @@ Barcode pipeline flow
 External APIs
 -------------
 - OpenFoodFacts  https://world.openfoodfacts.org/api/v2/product/{barcode}.json
-  No key required.  Must send a User-Agent header or requests are rejected.
-
 - IP Australia Trade Mark Search  (OAuth token managed in brand_pipeline)
-  Required .env: IP_AUSTRALIA_CLIENT_ID, IP_AUSTRALIA_CLIENT_SECRET
-  Optional .env: IP_AUSTRALIA_TOKEN_URL, IP_AUSTRALIA_TRADEMARK_URL
-
 - ABR Name Search  (passed in as abr_lookup_fn to avoid circular imports)
-  Required .env: ABR_GUID
 
 Usage
 -----
-From main.py barcode branch:
-
     from barcode_pipeline import run_barcode_phase
     from abn_pipeline   import search_company_name_with_abr
-
     result = run_barcode_phase(barcode, abr_lookup_fn=search_company_name_with_abr)
 """
 
@@ -53,7 +44,7 @@ import requests
 # Reuse the shared OAuth token cache and trademark helpers from brand_pipeline.
 from brand_pipeline import (
     _quick_search,
-    _fetch_trademark_detail,
+    _fetch_first_available_trademark,
     _extract_owner_from_record,
     _build_trademark_summary,
     _strip_legal_suffix,
@@ -73,15 +64,7 @@ _DEFAULT_TIMEOUT = 20
 # ============================================================
 
 def validate_ean13(barcode: str) -> Dict[str, Any]:
-    """
-    Validate that a string is a well-formed EAN-13 barcode.
-
-    Checks
-    ------
-    1. Digits only (spaces / dashes stripped first).
-    2. Exactly 13 digits.
-    3. Check digit correct per GS1 checksum algorithm.
-    """
+    """Validate EAN-13 format and GS1 checksum digit."""
     cleaned = re.sub(r"[\s\-]", "", barcode or "")
 
     if not cleaned.isdigit():
@@ -115,10 +98,7 @@ def validate_ean13(barcode: str) -> Dict[str, Any]:
 # ============================================================
 
 def _lookup_openfoodfacts(barcode: str) -> Dict[str, Any]:
-    """
-    Query the OpenFoodFacts v2 product API.
-    Returns success, source, and product fields.
-    """
+    """Query the OpenFoodFacts v2 product API."""
     url    = f"https://world.openfoodfacts.org/api/v2/product/{barcode}.json"
     params = {
         "fields": (
@@ -179,7 +159,6 @@ def extract_best_brand(
 ) -> Optional[str]:
     """
     Return the single best brand token for downstream trademark lookup.
-
     Priority: brand_owner > first token of brand_raw.
     Strips legal suffixes and collapses whitespace.
     """
@@ -218,12 +197,12 @@ def _resolve_trademark_owner(brand_token: str) -> Dict[str, Any]:
     Run an IP Australia Trade Mark quick search (WORD + REGISTERED) for
     *brand_token* and return the best-ranked legal owner name.
 
-    Calls the shared helpers imported from brand_pipeline so both
-    pipelines share the same OAuth token cache.
+    Uses _fetch_first_available_trademark to skip 404 IDs that are
+    absent from the test environment.
     """
     errors: List[str] = []
 
-    # Step A — quick search (WORD + REGISTERED)
+    # Step A — quick search
     search_resp = _quick_search(brand_token)
     if not search_resp.get("success"):
         msg = search_resp.get("message", "IP Australia trademark search failed")
@@ -248,17 +227,16 @@ def _resolve_trademark_owner(brand_token: str) -> Dict[str, Any]:
             "errors":      ["No registered word-mark trademarks found."],
         }
 
-    # Step B — fetch detail for the first (highest-relevance) ID
-    best_id     = str(ids[0])
-    detail_resp = _fetch_trademark_detail(best_id)
+    # Step B — walk IDs until one resolves
+    detail_resp = _fetch_first_available_trademark(ids)
 
     if not detail_resp.get("success"):
-        msg = detail_resp.get("message", f"Could not fetch trademark {best_id}")
+        msg = detail_resp.get("message", "Could not fetch any trademark detail record")
         errors.append(msg)
         return {
             "success":     False,
             "legal_owner": None,
-            "trademark":   {"number": best_id},
+            "trademark":   None,
             "candidates":  len(ids),
             "errors":      errors,
         }
@@ -286,19 +264,16 @@ def resolve_barcode(
 ) -> Dict[str, Any]:
     """
     Full barcode resolution pipeline.
-
-    Steps
-    -----
-    1. Validate EAN-13 format and checksum.
-    2. Query OpenFoodFacts.
+    1. Validate EAN-13.
+    2. OpenFoodFacts lookup.
     3. Normalise brand token.
-    4. IP Australia Trade Mark Search (WORD + REGISTERED) → legal owner.
+    4. IP Australia Trademark (WORD + REGISTERED, walk IDs on 404).
     5. ABR name lookup.
     """
     pipeline: List[str] = []
     errors:   List[str] = []
 
-    # Step 1 — Validate
+    # Step 1
     pipeline.append("EAN-13 validation")
     validation = validate_ean13(barcode)
     if not validation["valid"]:
@@ -312,7 +287,7 @@ def resolve_barcode(
         }
     clean_barcode = validation["digits"]
 
-    # Step 2 — OpenFoodFacts
+    # Step 2
     pipeline.append("OpenFoodFacts product lookup")
     off_result = _lookup_openfoodfacts(clean_barcode)
     if not off_result["success"]:
@@ -330,11 +305,11 @@ def resolve_barcode(
     brand_owner  = off_result.get("brand_owner")
     manufacturer = off_result.get("manufacturer")
 
-    # Step 3 — Normalise brand token
+    # Step 3
     pipeline.append("Brand extraction and normalisation")
     brand_clean = extract_best_brand(brand_raw, brand_owner)
 
-    # Step 4 — IP Australia Trademark
+    # Step 4
     tm_result:   Optional[Dict[str, Any]] = None
     legal_owner: Optional[str]            = None
     tm_search_token = brand_clean or brand_owner
@@ -348,7 +323,6 @@ def resolve_barcode(
 
         legal_owner = tm_result.get("legal_owner") if tm_result else None
 
-        # Retry with suffix-stripped brand_owner if initial search found nothing
         if not legal_owner and brand_owner:
             short = _strip_legal_suffix(brand_owner)
             if short and short != tm_search_token:
@@ -358,7 +332,7 @@ def resolve_barcode(
                     tm_result   = tm_retry
                     legal_owner = tm_retry["legal_owner"]
 
-    # Step 5 — ABR
+    # Step 5
     abr_result:     Optional[Dict[str, Any]] = None
     abr_search_term = legal_owner or brand_owner or brand_clean
 
@@ -371,7 +345,7 @@ def resolve_barcode(
             abr_result = abr_lookup_fn(brand_clean)
 
     # Confidence
-    confidence  = 40  # OpenFoodFacts hit
+    confidence  = 40
     confidence += 10 if brand_raw   else 0
     confidence += 5  if brand_owner else 0
     confidence += 5  if brand_clean else 0
