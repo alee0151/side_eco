@@ -15,7 +15,7 @@ ABN pipeline flow
       │
       ├─── 1. Format check     ── digits only, length == 11
       ├─── 2. Checksum         ── ATO weighted-sum algorithm (mod 89)
-      └─── 3. ABR lookup       ── SearchByABNv202001
+      └─── 3. ABR lookup       ── SearchByABNv202001 (REST GET)
                                    returns: legal name, entity type, ABN status,
                                             ACN, GST registration, state, postcode,
                                             main business activity
@@ -25,35 +25,37 @@ Company name pipeline flow
   User input (company / trading name string)
       │
       ├─── 1. Name validation  ── minimum 2 characters
-      └─── 2. ABR name search  ── ABRSearchByNameAdvancedSimpleProtocol2017
+      └─── 2. ABR name search  ── ABRSearchByName (SOAP POST)
                                    deduplicates by ABN
                                    prefers Active entities
                                    returns best_match + all_results
 
 External APIs
 -------------
-ABR SearchByABN:
+ABR SearchByABN (REST GET):
   GET https://abr.business.gov.au/abrxmlsearch/AbrXmlSearch.asmx/SearchByABNv202001
 
-ABR SearchByName:
-  GET https://abr.business.gov.au/abrxmlsearch/AbrXmlSearch.asmx/ABRSearchByNameAdvancedSimpleProtocol2017
+ABR SearchByName (SOAP POST)  — replaces the broken REST GET endpoint:
+  POST https://abr.business.gov.au/ABRXMLSearch/AbrXmlSearch.asmx
+  SOAPAction: http://abr.business.gov.au/ABRXMLSearch/ABRSearchByName
+
+  NOTE: ABRSearchByNameAdvancedSimpleProtocol2017 (REST GET) returns HTTP 500
+        and has been removed.  All name searches now use the SOAP endpoint.
 
 Required .env variable: ABR_GUID
 Obtain a free GUID from https://abr.business.gov.au/Tools/WebServices
 
 Public exports
 --------------
-Functions used outside this module:
-
     run_abn_phase(abn)               -> full ABN lookup with checksum validation
     run_company_phase(company_name)  -> full company name search
     run_company_abn_phase(value)     -> auto-detects ABN vs name; used by main.py
 
-    verify_abn_with_abr(abn)                  -> raw ABR ABN lookup (used by barcode/brand pipelines)
-    search_company_name_with_abr(name)         -> raw ABR name search  (used as abr_lookup_fn)
+    verify_abn_with_abr(abn)               -> raw ABR ABN lookup
+    search_company_name_with_abr(name)      -> raw ABR name search (abr_lookup_fn)
 
-    clean_abn(value)  -> strip whitespace from ABN string
-    is_abn(value)     -> True if value is 11 digits after cleaning
+    clean_abn(value)            -> strip whitespace from ABN string
+    is_abn(value)               -> True if value is 11 digits after cleaning
     validate_abn_checksum(abn)  -> True if ATO checksum passes
 """
 
@@ -78,10 +80,7 @@ def clean_abn(value: str) -> str:
 
 
 def is_abn(value: str) -> bool:
-    """Return True if the value is exactly 11 digits after whitespace removal.
-
-    Does NOT validate the checksum — call validate_abn_checksum() for that.
-    """
+    """Return True if the value is exactly 11 digits after whitespace removal."""
     cleaned = clean_abn(value)
     return cleaned.isdigit() and len(cleaned) == 11
 
@@ -90,37 +89,29 @@ def validate_abn_checksum(abn: str) -> bool:
     """
     Validate an ABN using the ATO weighted-sum checksum algorithm.
 
-    Algorithm (from https://abr.business.gov.au/Help/AbnFormat):
-    1. Subtract 1 from the first digit to produce an 11-digit working number.
-    2. Multiply each digit by its positional weight:
-       Weights: [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
-    3. Sum all products.
-    4. If the sum is divisible by 89 the ABN is valid.
-
-    Returns True for a valid ABN, False otherwise.
-    An ABN that fails is_abn() always returns False.
+    Algorithm (https://abr.business.gov.au/Help/AbnFormat):
+    1. Subtract 1 from the first digit.
+    2. Multiply each digit by weights [10,1,3,5,7,9,11,13,15,17,19].
+    3. Sum all products.  Valid if divisible by 89.
     """
     abn = clean_abn(abn)
     if not abn.isdigit() or len(abn) != 11:
         return False
-
     weights = [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
     digits  = [int(d) for d in abn]
-    digits[0] -= 1  # Step 1: subtract 1 from first digit
-
-    total = sum(d * w for d, w in zip(digits, weights))
-    return total % 89 == 0
+    digits[0] -= 1
+    return sum(d * w for d, w in zip(digits, weights)) % 89 == 0
 
 
 # ============================================================
-# ABR XML Namespace
+# ABR XML Namespace helpers
 # ============================================================
 
 _ABR_NS = {"abr": "http://abr.business.gov.au/ABRXMLSearch/"}
 
 
 def _text(node, path: str) -> Optional[str]:
-    """Find a child node by XPath and return its text, or None if not found."""
+    """Find child by XPath and return its .text, or None."""
     found = node.find(path, _ABR_NS)
     return found.text if found is not None else None
 
@@ -135,22 +126,15 @@ def _check_abr_exception(root) -> Optional[str]:
 
 
 # ============================================================
-# ABR ABN Lookup  (SearchByABNv202001)
+# ABR ABN Lookup  (REST GET — SearchByABNv202001)
 # ============================================================
 
 def verify_abn_with_abr(abn: str) -> Dict[str, Any]:
     """
-    Verify a single ABN via ABR SearchByABNv202001.
+    Verify a single ABN via ABR SearchByABNv202001 (REST GET).
 
-    Returns a dict with the entity's legal name, entity type, ABN status,
-    ACN, GST registration date, state, postcode and main business activity.
-
-    Required .env: ABR_GUID
-
-    Used by:
-    - run_abn_phase()         (ABN branch of /api/search)
-    - /api/abn/verify/:abn   (standalone endpoint in main.py)
-    - barcode_pipeline.py    (indirectly via search_company_name_with_abr)
+    Returns the entity's legal name, entity type, ABN status, ACN,
+    GST registration, state, postcode and main business activity.
     """
     guid = os.getenv("ABR_GUID", "").strip()
     if not guid:
@@ -162,9 +146,9 @@ def verify_abn_with_abr(abn: str) -> Dict[str, Any]:
 
     url    = "https://abr.business.gov.au/abrxmlsearch/AbrXmlSearch.asmx/SearchByABNv202001"
     params = {
-        "searchString":            abn,
+        "searchString":             abn,
         "includeHistoricalDetails": "N",
-        "authenticationGuid":      guid,
+        "authenticationGuid":       guid,
     }
 
     try:
@@ -178,40 +162,22 @@ def verify_abn_with_abr(abn: str) -> Dict[str, Any]:
     except ET.ParseError as e:
         return {"success": False, "source": "ABR", "message": f"Invalid XML from ABR: {e}"}
 
-    # Check for ABR-level error first.
     err = _check_abr_exception(root)
     if err:
         return {"success": False, "source": "ABR", "message": err}
 
-    # ABN node: identifierValue whose type is ABN.
     abn_node = root.find(".//abr:identifierValue", _ABR_NS)
     if abn_node is None:
         return {"success": False, "source": "ABR", "message": "ABN not found in ABR register"}
 
-    # ----------------------------------------------------------------
-    # Legal name — organisations use organisationName; individuals use
-    # given/family name combination.
-    # ----------------------------------------------------------------
-    org_name   = _text(root, ".//abr:organisationName")
-    given_name = _text(root, ".//abr:givenName")
+    org_name    = _text(root, ".//abr:organisationName")
+    given_name  = _text(root, ".//abr:givenName")
     family_name = _text(root, ".//abr:familyName")
-    legal_name = (
-        org_name
-        or " ".join(filter(None, [given_name, family_name]))
-        or None
-    )
+    legal_name  = org_name or " ".join(filter(None, [given_name, family_name])) or None
 
-    # ----------------------------------------------------------------
-    # Entity type (e.g., "Australian Private Company", "Individual/Sole Trader")
-    # ----------------------------------------------------------------
     entity_type_code = _text(root, ".//abr:entityTypeCode")
-    entity_type_desc = _text(root, ".//abr:entityTypeDescription")
-    if not entity_type_desc and entity_type_code:
-        entity_type_desc = entity_type_code
+    entity_type_desc = _text(root, ".//abr:entityTypeDescription") or entity_type_code
 
-    # ----------------------------------------------------------------
-    # ACN (if the entity has one)
-    # ----------------------------------------------------------------
     acn = None
     for id_node in root.findall(".//abr:identifier", _ABR_NS):
         id_type  = _text(id_node, ".//abr:identifierType")
@@ -220,73 +186,218 @@ def verify_abn_with_abr(abn: str) -> Dict[str, Any]:
             acn = id_value
             break
 
-    # ----------------------------------------------------------------
-    # GST registration
-    # ----------------------------------------------------------------
-    gst_node         = root.find(".//abr:goodsAndServicesTax", _ABR_NS)
-    gst_registered   = gst_node is not None
-    gst_from_date    = _text(root, ".//abr:goodsAndServicesTax/abr:effectiveFrom") if gst_registered else None
+    gst_node       = root.find(".//abr:goodsAndServicesTax", _ABR_NS)
+    gst_registered = gst_node is not None
+    gst_from_date  = _text(root, ".//abr:goodsAndServicesTax/abr:effectiveFrom") if gst_registered else None
 
-    # ----------------------------------------------------------------
-    # Main business address
-    # ----------------------------------------------------------------
     state    = _text(root, ".//abr:mainBusinessPhysicalAddress/abr:stateCode") \
              or _text(root, ".//abr:stateCode")
     postcode = _text(root, ".//abr:mainBusinessPhysicalAddress/abr:postcode") \
              or _text(root, ".//abr:postcode")
 
-    # ----------------------------------------------------------------
-    # Main business activity (ANZSIC code + description)
-    # ----------------------------------------------------------------
     anzsic_code = _text(root, ".//abr:mainBusinessActivity/abr:code")
-    anzsic_desc = _text(root, ".//abr:mainBusinessActivity/abr:description")
-    if anzsic_code and not anzsic_desc:
-        anzsic_desc = anzsic_code
+    anzsic_desc = _text(root, ".//abr:mainBusinessActivity/abr:description") or anzsic_code
 
-    # ----------------------------------------------------------------
-    # ABN status
-    # ----------------------------------------------------------------
     abn_status = (
         _text(root, ".//abr:entityStatus/abr:entityStatusCode")
         or _text(root, ".//abr:entityStatusCode")
     )
 
     return {
-        "success":         True,
-        "source":          "ABR",
-        "abn":             abn_node.text,
-        "legal_name":      legal_name,
-        "entity_type":     entity_type_desc,
+        "success":          True,
+        "source":           "ABR",
+        "abn":              abn_node.text,
+        "legal_name":       legal_name,
+        "entity_type":      entity_type_desc,
         "entity_type_code": entity_type_code,
-        "acn":             acn,
-        "state":           state,
-        "postcode":        postcode,
-        "abn_status":      abn_status,
-        "gst_registered":  gst_registered,
-        "gst_from_date":   gst_from_date,
-        "main_activity":   anzsic_desc,
-        "verified":        True,
+        "acn":              acn,
+        "state":            state,
+        "postcode":         postcode,
+        "abn_status":       abn_status,
+        "gst_registered":   gst_registered,
+        "gst_from_date":    gst_from_date,
+        "main_activity":    anzsic_desc,
+        "verified":         True,
     }
 
 
 # ============================================================
-# ABR Company Name Search  (ABRSearchByNameAdvancedSimpleProtocol2017)
+# ABR Company Name Search  (SOAP POST — ABRSearchByName)
+#
+# The previous REST GET endpoint (ABRSearchByNameAdvancedSimpleProtocol2017)
+# returns HTTP 500.  The SOAP endpoint is the supported alternative.
+# Reference: abn_trial.py (confirmed working with the project GUID).
 # ============================================================
+
+_ABR_SOAP_URL    = "https://abr.business.gov.au/ABRXMLSearch/AbrXmlSearch.asmx"
+_ABR_SOAP_ACTION = "http://abr.business.gov.au/ABRXMLSearch/ABRSearchByName"
+
+
+def _build_name_search_soap_body(name: str, guid: str) -> str:
+    """
+    Build the SOAP 1.1 envelope for ABRSearchByName.
+
+    Searches legal names and trading names across all Australian
+    states and territories.
+    """
+    # XML-escape the name to prevent injection.
+    safe_name = (
+        name
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope
+    xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+    xmlns:abr="http://abr.business.gov.au/ABRXMLSearch/">
+  <soap:Body>
+    <abr:ABRSearchByName>
+      <abr:externalNameSearch>
+        <abr:authenticationGuid>{guid}</abr:authenticationGuid>
+        <abr:name>{safe_name}</abr:name>
+        <abr:postcode></abr:postcode>
+        <abr:nameType>
+          <abr:tradingName>Y</abr:tradingName>
+          <abr:legalName>Y</abr:legalName>
+        </abr:nameType>
+        <abr:filters>
+          <abr:NSW>Y</abr:NSW>
+          <abr:SA>Y</abr:SA>
+          <abr:ACT>Y</abr:ACT>
+          <abr:VIC>Y</abr:VIC>
+          <abr:WA>Y</abr:WA>
+          <abr:NT>Y</abr:NT>
+          <abr:QLD>Y</abr:QLD>
+          <abr:TAS>Y</abr:TAS>
+        </abr:filters>
+      </abr:externalNameSearch>
+    </abr:ABRSearchByName>
+  </soap:Body>
+</soap:Envelope>"""
+
+
+def _parse_soap_name_response(
+    xml_text:     str,
+    company_name: str,
+) -> Dict[str, Any]:
+    """
+    Parse the SOAP response from ABRSearchByName.
+
+    Navigates: Envelope > Body > ABRSearchByNameResponse
+                > ABRSearchByNameResult > response > businessEntity202001[]
+
+    Each businessEntity202001 contains:
+      ABN/identifierValue, ABN/identifierStatus,
+      entityType/entityTypeCode + entityDescription,
+      mainName/organisationName (legal name),
+      mainTradingName/organisationName,
+      mainBusinessPhysicalAddress/stateCode + postcode
+
+    Returns a list of normalised result dicts.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        return {"success": False, "message": f"SOAP XML parse error: {e}", "results": []}
+
+    # Check for ABR-level exception inside the response.
+    err = _check_abr_exception(root)
+    if err:
+        return {"success": False, "message": err, "results": []}
+
+    # businessEntity202001 elements can appear at any nesting level inside the
+    # SOAP envelope depending on whether the namespace prefix is used.
+    entities = root.findall(".//abr:businessEntity202001", _ABR_NS)
+
+    # Some ABR responses omit the namespace prefix on businessEntity202001.
+    # Try unqualified tag as a fallback.
+    if not entities:
+        entities = root.findall(".//businessEntity202001")
+
+    if not entities:
+        return {"success": False, "message": f"No results for '{company_name}'", "results": []}
+
+    results:   List[Dict] = []
+    seen_abns: set        = set()
+
+    for entity in entities:
+        # ---- ABN value and status ----
+        abn_val    = (
+            _text(entity, "abr:ABN/abr:identifierValue")
+            or _text(entity, ".//abr:identifierValue")
+        )
+        abn_status = (
+            _text(entity, "abr:ABN/abr:identifierStatus")
+            or _text(entity, ".//abr:identifierStatus")
+            or _text(entity, ".//abr:entityStatusCode")
+        )
+
+        if abn_val in seen_abns:
+            continue
+        seen_abns.add(abn_val)
+
+        # ---- Legal / organisation name ----
+        legal_name = (
+            _text(entity, "abr:mainName/abr:organisationName")
+            or _text(entity, ".//abr:organisationName")
+        )
+        if not legal_name:
+            given  = _text(entity, ".//abr:givenName")
+            family = _text(entity, ".//abr:familyName")
+            legal_name = " ".join(filter(None, [given, family])) or company_name
+
+        # ---- Trading name (optional extra context) ----
+        trading_name = _text(entity, "abr:mainTradingName/abr:organisationName")
+
+        # ---- Entity type ----
+        entity_type = (
+            _text(entity, "abr:entityType/abr:entityDescription")
+            or _text(entity, ".//abr:entityDescription")
+            or _text(entity, ".//abr:entityTypeDescription")
+            or _text(entity, ".//abr:entityTypeCode")
+        )
+
+        # ---- Address ----
+        state = (
+            _text(entity, "abr:mainBusinessPhysicalAddress/abr:stateCode")
+            or _text(entity, ".//abr:stateCode")
+        )
+        postcode = (
+            _text(entity, "abr:mainBusinessPhysicalAddress/abr:postcode")
+            or _text(entity, ".//abr:postcode")
+        )
+
+        results.append({
+            "abn":          abn_val,
+            "legal_name":   legal_name,
+            "trading_name": trading_name,
+            "entity_type":  entity_type,
+            "state":        state,
+            "postcode":     postcode,
+            "abn_status":   abn_status,
+            "verified":     abn_val is not None,
+        })
+
+    return {"success": True, "results": results}
+
 
 def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
     """
-    Search ABR by company or business name.
+    Search ABR by company or business name using the SOAP POST endpoint.
 
-    Returns the best match (Active entity with ABN preferred) plus all
-    deduplicated results ordered by relevance.
+    Replaces the broken REST GET (ABRSearchByNameAdvancedSimpleProtocol2017).
+    Uses ABRSearchByName SOAP action as demonstrated in abn_trial.py.
+
+    Returns the best Active match plus all deduplicated results.
 
     Used by:
-    - run_company_phase()            (company name branch of /api/search)
-    - barcode_pipeline.py            (passed in as abr_lookup_fn)
-    - brand_pipeline.py              (passed in as abr_lookup_fn)
-    - /api/company/search/:name     (standalone endpoint in main.py)
-
-    Required .env: ABR_GUID
+    - run_company_phase()           (company name branch of /api/search)
+    - barcode_pipeline.py           (passed in as abr_lookup_fn)
+    - brand_pipeline.py             (passed in as abr_lookup_fn)
+    - /api/company/search/:name    (standalone endpoint in main.py)
     """
     guid = os.getenv("ABR_GUID", "").strip()
     if not guid:
@@ -294,37 +405,45 @@ def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
 
     company_name = (company_name or "").strip()
     if len(company_name) < 2:
-        return {"success": False, "source": "ABR", "message": "Company name must be at least 2 characters"}
+        return {
+            "success": False, "source": "ABR",
+            "message": "Company name must be at least 2 characters",
+        }
 
-    url    = "https://abr.business.gov.au/abrxmlsearch/AbrXmlSearch.asmx/ABRSearchByNameAdvancedSimpleProtocol2017"
-    params = {
-        "name":               company_name,
-        "postcode":           "",
-        "legalName":          "Y",
-        "tradingName":        "Y",
-        # Include all Australian states/territories.
-        "NSW": "Y", "SA": "Y", "ACT": "Y", "VIC": "Y",
-        "WA":  "Y", "NT":  "Y", "QLD": "Y", "TAS": "Y",
-        "authenticationGuid": guid,
+    soap_body = _build_name_search_soap_body(company_name, guid)
+    headers   = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction":   _ABR_SOAP_ACTION,
+        "User-Agent":   "EcoTrace-App/1.0 (student project)",
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=20)
+        resp = requests.post(
+            _ABR_SOAP_URL,
+            data=soap_body.encode("utf-8"),
+            headers=headers,
+            timeout=20,
+        )
         resp.raise_for_status()
-        root = ET.fromstring(resp.text)
     except requests.exceptions.Timeout:
-        return {"success": False, "source": "ABR", "message": "ABR request timed out"}
+        return {"success": False, "source": "ABR", "message": "ABR SOAP request timed out"}
     except requests.exceptions.RequestException as e:
-        return {"success": False, "source": "ABR", "message": f"Network error: {e}"}
-    except ET.ParseError as e:
-        return {"success": False, "source": "ABR", "message": f"Invalid XML from ABR: {e}"}
+        return {"success": False, "source": "ABR", "message": f"ABR SOAP network error: {e}"}
 
-    err = _check_abr_exception(root)
-    if err:
-        return {"success": False, "source": "ABR", "message": err}
+    parsed = _parse_soap_name_response(resp.text, company_name)
 
-    businesses = root.findall(".//abr:businessEntity", _ABR_NS)
-    if not businesses:
+    if not parsed["success"]:
+        return {
+            "success":     False,
+            "source":      "ABR",
+            "message":     parsed.get("message", "ABR name search failed"),
+            "all_results": [],
+            "total":       0,
+        }
+
+    results = parsed["results"]
+
+    if not results:
         return {
             "success":     False,
             "source":      "ABR",
@@ -333,63 +452,11 @@ def search_company_name_with_abr(company_name: str) -> Dict[str, Any]:
             "total":       0,
         }
 
-    results:  List[Dict] = []
-    seen_abns: set       = set()
-
-    for business in businesses:
-        abn_node    = business.find(".//abr:identifierValue", _ABR_NS)
-        state_node  = business.find(".//abr:stateCode", _ABR_NS)
-        post_node   = business.find(".//abr:postcode",   _ABR_NS)
-        status_node = business.find(".//abr:entityStatusCode", _ABR_NS)
-        type_node   = business.find(".//abr:entityTypeDescription", _ABR_NS)
-
-        abn_val = abn_node.text if abn_node is not None else None
-        if abn_val in seen_abns:
-            continue
-        seen_abns.add(abn_val)
-
-        # ----------------------------------------------------------------
-        # Legal name: organisations use organisationName; individuals use
-        # givenName + familyName.
-        # ----------------------------------------------------------------
-        name_node = business.find(".//abr:organisationName", _ABR_NS)
-        if name_node is not None:
-            legal_name = name_node.text
-        else:
-            given  = business.find(".//abr:givenName",  _ABR_NS)
-            family = business.find(".//abr:familyName", _ABR_NS)
-            legal_name = " ".join(
-                filter(None, [
-                    given.text  if given  is not None else None,
-                    family.text if family is not None else None,
-                ])
-            ) or company_name
-
-        results.append({
-            "abn":         abn_val,
-            "legal_name":  legal_name,
-            "state":       state_node.text  if state_node  is not None else None,
-            "postcode":    post_node.text   if post_node   is not None else None,
-            "abn_status":  status_node.text if status_node is not None else None,
-            "entity_type": type_node.text   if type_node   is not None else None,
-            "verified":    abn_val is not None,
-        })
-
-    # Prefer the first Active entity with a verified ABN.
-    # Fall back to the first result if none qualify.
+    # Prefer first Active entity with a verified ABN.
     best = next(
-        (r for r in results if r.get("abn_status") == "Active" and r["abn"]),
-        results[0] if results else None,
+        (r for r in results if r.get("abn_status", "").lower() == "active" and r["abn"]),
+        results[0],
     )
-
-    if not best:
-        return {
-            "success":     False,
-            "source":      "ABR",
-            "message":     f"No company found in ABR for '{company_name}'",
-            "all_results": results,
-            "total":       len(results),
-        }
 
     return {
         "success":     True,
@@ -409,31 +476,7 @@ def run_abn_phase(abn: str) -> Dict[str, Any]:
     """
     Full ABN input pipeline.
 
-    Steps
-    -----
-    1. Format check  — must be 11 digits after whitespace removal
-    2. Checksum      — ATO weighted-sum mod-89 algorithm
-    3. ABR lookup    — legal name, entity type, ACN, GST, state, postcode
-
-    Returns
-    -------
-    dict with:
-        success        bool
-        abn            str   cleaned 11-digit ABN
-        valid_format   bool
-        valid_checksum bool
-        legal_name     str   from ABR (or None)
-        entity_type    str   from ABR (or None)
-        acn            str   from ABR (or None)
-        abn_status     str   'Active' | 'Cancelled' | ... (from ABR)
-        gst_registered bool
-        state          str   from ABR
-        postcode       str   from ABR
-        main_activity  str   ANZSIC description (or None)
-        source         str   'ABR'
-        confidence     int   0-100
-        pipeline       list  executed steps
-        errors         list  non-fatal warnings
+    Steps: format check -> checksum (mod-89) -> ABR ABN lookup.
     """
     pipeline: List[str] = []
     errors:   List[str] = []
@@ -441,9 +484,6 @@ def run_abn_phase(abn: str) -> Dict[str, Any]:
     abn_raw = abn
     abn     = clean_abn(abn)
 
-    # ----------------------------------------------------------
-    # Step 1 — Format check
-    # ----------------------------------------------------------
     pipeline.append("ABN format check")
     valid_format = is_abn(abn)
     if not valid_format:
@@ -458,20 +498,14 @@ def run_abn_phase(abn: str) -> Dict[str, Any]:
             "confidence":     0,
         }
 
-    # ----------------------------------------------------------
-    # Step 2 — Checksum validation
-    # ----------------------------------------------------------
     pipeline.append("ABN checksum validation (ATO mod-89)")
     valid_checksum = validate_abn_checksum(abn)
     if not valid_checksum:
         errors.append(
-            f"ABN {abn} fails the ATO checksum — this ABN is not mathematically valid. "
-            "The search will still proceed against ABR."
+            f"ABN {abn} fails the ATO checksum — mathematically invalid. "
+            "Search will still proceed."
         )
 
-    # ----------------------------------------------------------
-    # Step 3 — ABR lookup
-    # ----------------------------------------------------------
     pipeline.append(f"ABR ABN lookup: {abn}")
     abr = verify_abn_with_abr(abn)
 
@@ -488,37 +522,34 @@ def run_abn_phase(abn: str) -> Dict[str, Any]:
             "confidence":     10 if valid_checksum else 0,
         }
 
-    # ----------------------------------------------------------
-    # Confidence scoring
-    # ----------------------------------------------------------
     confidence = 0
-    if valid_format:                                    confidence += 10
-    if valid_checksum:                                  confidence += 20
-    if abr.get("abn_status") == "Active":               confidence += 50
-    elif abr.get("abn_status"):                         confidence += 20
-    if abr.get("gst_registered"):                       confidence += 10
-    if abr.get("legal_name"):                           confidence += 10
+    if valid_format:                          confidence += 10
+    if valid_checksum:                        confidence += 20
+    if abr.get("abn_status") == "Active":     confidence += 50
+    elif abr.get("abn_status"):               confidence += 20
+    if abr.get("gst_registered"):             confidence += 10
+    if abr.get("legal_name"):                 confidence += 10
 
     return {
-        "success":         True,
-        "abn":             abn,
-        "valid_format":    valid_format,
-        "valid_checksum":  valid_checksum,
-        "legal_name":      abr.get("legal_name"),
-        "entity_type":     abr.get("entity_type"),
+        "success":          True,
+        "abn":              abn,
+        "valid_format":     valid_format,
+        "valid_checksum":   valid_checksum,
+        "legal_name":       abr.get("legal_name"),
+        "entity_type":      abr.get("entity_type"),
         "entity_type_code": abr.get("entity_type_code"),
-        "acn":             abr.get("acn"),
-        "state":           abr.get("state"),
-        "postcode":        abr.get("postcode"),
-        "abn_status":      abr.get("abn_status"),
-        "gst_registered":  abr.get("gst_registered"),
-        "gst_from_date":   abr.get("gst_from_date"),
-        "main_activity":   abr.get("main_activity"),
-        "source":          "ABR",
-        "status":          "external_resolved" if abr.get("abn_status") == "Active" else "external_found",
-        "confidence":      min(confidence, 100),
-        "pipeline":        pipeline,
-        "errors":          errors,
+        "acn":              abr.get("acn"),
+        "state":            abr.get("state"),
+        "postcode":         abr.get("postcode"),
+        "abn_status":       abr.get("abn_status"),
+        "gst_registered":   abr.get("gst_registered"),
+        "gst_from_date":    abr.get("gst_from_date"),
+        "main_activity":    abr.get("main_activity"),
+        "source":           "ABR",
+        "status":           "external_resolved" if abr.get("abn_status") == "Active" else "external_found",
+        "confidence":       min(confidence, 100),
+        "pipeline":         pipeline,
+        "errors":           errors,
     }
 
 
@@ -526,32 +557,13 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
     """
     Full company name input pipeline.
 
-    Steps
-    -----
-    1. Name validation  — minimum 2 characters
-    2. ABR name search  — all Australian states, legal + trading names
-
-    Returns
-    -------
-    dict with:
-        success      bool
-        company_name str   input as provided
-        company      dict  best match: legal_name, abn, entity_type, state, postcode, abn_status
-        all_results  list  all deduplicated ABR matches
-        total        int   count of all matches
-        source       str   'ABR'
-        confidence   int   0-100
-        pipeline     list  executed steps
-        errors       list  non-fatal warnings
+    Steps: name validation -> ABR name search (SOAP POST).
     """
     pipeline: List[str] = []
     errors:   List[str] = []
 
     company_name = (company_name or "").strip()
 
-    # ----------------------------------------------------------
-    # Step 1 — Validate
-    # ----------------------------------------------------------
     pipeline.append("Company name validation")
     if len(company_name) < 2:
         return {
@@ -563,9 +575,6 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
             "confidence":   0,
         }
 
-    # ----------------------------------------------------------
-    # Step 2 — ABR name search
-    # ----------------------------------------------------------
     pipeline.append(f"ABR company name search: '{company_name}'")
     abr = search_company_name_with_abr(company_name)
 
@@ -586,15 +595,12 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
 
     best = abr.get("best_match", {})
 
-    # ----------------------------------------------------------
-    # Confidence scoring
-    # ----------------------------------------------------------
     confidence = 0
-    if best.get("abn"):                                 confidence += 30
-    if best.get("abn_status") == "Active":              confidence += 40
-    elif best.get("abn_status"):                        confidence += 15
-    if best.get("legal_name"):                          confidence += 20
-    if abr.get("total", 0) == 1:                        confidence += 10  # exact match
+    if best.get("abn"):                        confidence += 30
+    if best.get("abn_status", "").lower() == "active": confidence += 40
+    elif best.get("abn_status"):               confidence += 15
+    if best.get("legal_name"):                 confidence += 20
+    if abr.get("total", 0) == 1:               confidence += 10
 
     return {
         "success":      True,
@@ -610,7 +616,7 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
         "all_results":  abr.get("all_results", []),
         "total":        abr.get("total", 0),
         "source":       "ABR",
-        "status":       "external_resolved" if best.get("abn_status") == "Active" else "external_found",
+        "status":       "external_resolved" if best.get("abn_status", "").lower() == "active" else "external_found",
         "confidence":   min(confidence, 100),
         "pipeline":     pipeline,
         "errors":       errors,
@@ -619,17 +625,10 @@ def run_company_phase(company_name: str) -> Dict[str, Any]:
 
 def run_company_abn_phase(value: str) -> Dict[str, Any]:
     """
-    Auto-detect whether the input is an ABN or a company name and dispatch
-    to the appropriate pipeline.
+    Auto-detect ABN vs company name and dispatch to the right pipeline.
 
-    Used by the company_name branch in main.py /api/search.
-
-    Detection rule:
-    - If the value is exactly 11 digits (after whitespace removal) -> run_abn_phase()
-    - Otherwise -> run_company_phase()
-
-    This means inputs like '88 000 014 675' are treated as ABN,
-    and inputs like 'Coles Group' are treated as company name.
+    - 11 digits (after whitespace removal) -> run_abn_phase()
+    - Anything else                        -> run_company_phase()
     """
     cleaned = clean_abn(value)
     if cleaned.isdigit() and len(cleaned) == 11:
